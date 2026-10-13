@@ -25,7 +25,7 @@ Instalação rápida (setup)
 No Kali, como root, rode o setup da XPSec Academy — ele baixa e prepara o lab:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/XPSec-Security/wifilab/main/wifilab-setup-academy.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/XPSec-Security/wifilab/refs/heads/main/wifilab-setup-academy.sh | sudo bash
 ```
 
 ---

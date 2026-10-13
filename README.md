@@ -20,6 +20,16 @@ vulnerável no ar.
 
 ---
 
+Instalação rápida (setup)
+
+No Kali, como root, rode o setup da XPSec Academy — ele baixa e prepara o lab:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/XPSec-Security/wifilab/main/wifilab-setup-academy.sh | sudo bash
+```
+
+---
+
 ## Uso
 
 ```bash

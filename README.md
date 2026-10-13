@@ -1,7 +1,7 @@
 # XPSec Academy | Laboratório de WiFi Pentesting (virtual, sem RF)
 
 Laboratório de WiFi 100% **virtual** para o **Módulo 4** da XPSec Academy. Sobe várias
-redes vulneráveis (WPS, WPA2-PSK, OPEN, filtro de MAC, PMKID e WPA2-Enterprise)
+redes vulneráveis (WPA2-PSK, OPEN, filtro de MAC, PMKID e WPA2-Enterprise)
 usando rádios simulados em software (`mac80211_hwsim`). **Nenhum sinal de RF real é
 transmitido**, as redes não são visíveis por celulares, notebooks ou qualquer
 dispositivo ao redor. Zero risco de expor a rede de um aluno ou deixar uma rede
@@ -35,12 +35,11 @@ sudo ./xpsec-wifi-lab-pro.sh --down          # destrói tudo
 
 | # | SSID | Banda / Canal | Cenário | Credencial / segredo |
 |---|------|---------------|---------|----------------------|
-| 1 | `XPSEC-WPS` | 2.4 / 6 | WPA2 + WPS | PIN do AP `12345670` · PSK `SenhaWPS2026` |
-| 2 | `XPSEC-WPA2` | 2.4 / 11 | WPA2-PSK fraca | senha `verao2024` |
-| 3 | `XPSEC-OPEN` | 2.4 / 3 | Aberta + login HTTP em claro | `funcionario` / `Intranet@2026` |
-| 4 | `XPSEC-MACACL` | 2.4 / 9 | Aberta + filtro de MAC | MAC autorizado `02:ca:fe:00:11:22` |
-| 5 | `XPSEC-PMKID` | 5 / 36 | WPA2-PSK clientless (PMKID) | senha `familia10` |
-| 6 | `XPSEC-CORP` | 5 / 149 | WPA2-Enterprise (hostapd-wpe) | `funcionario@xpsec.local` / `Senha@Corp123` |
+| 1 | `XPSEC-WPA2` | 2.4 / 11 | WPA2-PSK fraca | senha `verao2024` |
+| 2 | `XPSEC-OPEN` | 2.4 / 3 | Aberta + login HTTP em claro | `funcionario` / `Intranet@2026` |
+| 3 | `XPSEC-MACACL` | 2.4 / 9 | Aberta + filtro de MAC | MAC autorizado `02:ca:fe:00:11:22` |
+| 4 | `XPSEC-PMKID` | 5 / 36 | WPA2-PSK clientless (PMKID) | senha `familia10` |
+| 5 | `XPSEC-CORP` | 5 / 149 | WPA2-Enterprise (hostapd-wpe) | `funcionario@xpsec.local` / `Senha@Corp123` |
 
 Interface livre para o aluno colocar em monitor: **`mon_lab`**.
 Interface managed livre para o registrar WPS: **`atk_wps`**.
@@ -50,7 +49,6 @@ Interface managed livre para o registrar WPS: **`atk_wps`**.
 ## Mapa de credenciais (gabarito)
 
 ```
-XPSEC-WPS      PIN AP:    12345670      PSK: SenhaWPS2026
 XPSEC-WPA2     senha:     verao2024
 XPSEC-OPEN     login:     funcionario / Intranet@2026
 XPSEC-MACACL   MAC ok:    02:ca:fe:00:11:22

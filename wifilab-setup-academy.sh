@@ -317,10 +317,6 @@ network={
     key_mgmt=NONE
 }
 EOF
-  wpa_supplicant -B -i "$STA_OPEN" -c "$LAB_DIR/sta_open.conf" -f "$LAB_DIR/wpa_open.log" 2>/dev/null
-  sleep 3
-  ( dhclient -v "$STA_OPEN" 2>"$LAB_DIR/dhcp_open.log" || ip addr add "${OPEN_NET}.60/24" dev "$STA_OPEN" ) &
-  sleep 3
 
   cat > "$LAB_DIR/open_bot.sh" <<EOF
 #!/bin/bash
@@ -331,7 +327,42 @@ while true; do
 done
 EOF
   chmod +x "$LAB_DIR/open_bot.sh"
-  nohup "$LAB_DIR/open_bot.sh" >/dev/null 2>&1 &
+
+  # Mesmo motivo do MACACL: se o cliente e o AP ficam no MESMO namespace, o
+  # HTTP ao IP do AP é entregue por loopback (local) e NÃO passa pelo rádio ->
+  # o monitor não vê o STATION e a captura do POST fica vazia. Num netns
+  # separado o tráfego é obrigado a sair pelo rádio virtual (meio hwsim global).
+  local phy; phy=$(phy_of "$STA_OPEN")
+  if [[ -n "$phy" ]] && ip netns add "$OPEN_NS" 2>/dev/null; then
+    ip link set "$STA_OPEN" down 2>/dev/null
+    if iw phy "$phy" set netns name "$OPEN_NS" 2>/dev/null; then
+      ip netns exec "$OPEN_NS" ip link set lo up 2>/dev/null
+      ip netns exec "$OPEN_NS" ip link set "$STA_OPEN" up 2>/dev/null
+      ip netns exec "$OPEN_NS" wpa_supplicant -B -i "$STA_OPEN" \
+        -c "$LAB_DIR/sta_open.conf" -f "$LAB_DIR/wpa_open.log" 2>/dev/null
+      sleep 3
+      ip netns exec "$OPEN_NS" ip addr add "${OPEN_NET}.60/24" dev "$STA_OPEN" 2>/dev/null
+      # bot dentro do netns: o GET/POST agora atravessa o rádio (visível no monitor)
+      nohup ip netns exec "$OPEN_NS" bash "$LAB_DIR/open_bot.sh" >/dev/null 2>&1 &
+      echo $! > "$LAB_DIR/open_bot.pid"
+      OK "  Cliente OPEN associado (netns $OPEN_NS, IP ${OPEN_NET}.60) -> STATION visível no airodump (canal 3)."
+      OK "Bot OPEN: login em texto claro no ar (user=funcionario / pass=Intranet@2026)."
+      return 0
+    else
+      WARN "  Falha ao mover o rádio p/ o netns; usando modo simples (STATION pode não aparecer)."
+      ip netns del "$OPEN_NS" 2>/dev/null
+    fi
+  else
+    WARN "  Sem netns disponível; usando modo simples (STATION pode não aparecer)."
+  fi
+
+  # Fallback (sem netns): tudo no namespace raiz -> o tráfego vai por loopback
+  # e o STATION pode não aparecer no monitor.
+  wpa_supplicant -B -i "$STA_OPEN" -c "$LAB_DIR/sta_open.conf" -f "$LAB_DIR/wpa_open.log" 2>/dev/null
+  sleep 3
+  ( dhclient -v "$STA_OPEN" 2>"$LAB_DIR/dhcp_open.log" || ip addr add "${OPEN_NET}.60/24" dev "$STA_OPEN" ) &
+  sleep 3
+  nohup bash "$LAB_DIR/open_bot.sh" >/dev/null 2>&1 &
   echo $! > "$LAB_DIR/open_bot.pid"
   OK "Bot OPEN: login em texto claro (user=funcionario / pass=Intranet@2026)."
 }
@@ -356,6 +387,7 @@ EOF
   done
 }
 
+OPEN_NS="xpsec_open"       # netns do cliente da rede OPEN (tráfego visível no monitor)
 MACACL_NS="xpsec_macacl"   # netns do cliente autorizado
 
 start_macacl_client() {
@@ -444,11 +476,13 @@ lab_down() {
   pkill -f "open_server.py" 2>/dev/null
   pkill -x hostapd-wpe 2>/dev/null
   pkill -f "dnsmasq.*${AP_OPEN}" 2>/dev/null
-  # netns do cliente MACACL: mata processos dentro dele e remove
-  if ip netns list 2>/dev/null | grep -q "${MACACL_NS:-xpsec_macacl}"; then
-    ip netns pids "${MACACL_NS:-xpsec_macacl}" 2>/dev/null | xargs -r kill 2>/dev/null
-    ip netns del "${MACACL_NS:-xpsec_macacl}" 2>/dev/null && OK "netns do MACACL removido."
-  fi
+  # netns dos clientes (OPEN e MACACL): mata processos dentro e remove
+  for _ns in "${OPEN_NS:-xpsec_open}" "${MACACL_NS:-xpsec_macacl}"; do
+    if ip netns list 2>/dev/null | grep -q "$_ns"; then
+      ip netns pids "$_ns" 2>/dev/null | xargs -r kill 2>/dev/null
+      ip netns del "$_ns" 2>/dev/null && OK "netns $_ns removido."
+    fi
+  done
   sleep 1
   modprobe -r mac80211_hwsim 2>/dev/null && OK "mac80211_hwsim removido." \
     || WARN "Não removi mac80211_hwsim (ainda em uso). Rode --down de novo."
@@ -459,6 +493,13 @@ lab_down() {
 lab_status() {
   LOG "Interfaces 802.11:"; iw dev 2>/dev/null | awk '/Interface/{print "  - "$2}'
   echo; LOG "APs (hostapd/hostapd-wpe no host):"; pgrep -af 'hostapd' | grep -E "$LAB_DIR" || echo "  (nenhum)"
+  echo; LOG "Cliente OPEN (netns ${OPEN_NS:-xpsec_open}):"
+  if ip netns list 2>/dev/null | grep -q "${OPEN_NS:-xpsec_open}"; then
+    ip netns exec "${OPEN_NS:-xpsec_open}" iw dev "$STA_OPEN" link 2>/dev/null \
+      | awk '/Connected|SSID/{print "  "$0}' || echo "  (no netns, sem link)"
+  else
+    echo "  (netns ausente)"
+  fi
   echo; LOG "Cliente MACACL (netns ${MACACL_NS:-xpsec_macacl}):"
   if ip netns list 2>/dev/null | grep -q "${MACACL_NS:-xpsec_macacl}"; then
     ip netns exec "${MACACL_NS:-xpsec_macacl}" iw dev "$STA_MACACL" link 2>/dev/null \

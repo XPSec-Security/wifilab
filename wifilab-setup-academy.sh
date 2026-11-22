@@ -383,7 +383,28 @@ network={
 }
 EOF
     wpa_supplicant -B -i "$ifc" -c "$LAB_DIR/${ifc}.conf" -f "$LAB_DIR/${ifc}.log" 2>/dev/null \
-      && OK "  $ifc -> $ssid" || WARN "  $ifc não associou"
+      && OK "  $ifc -> $ssid (daemon no ar)" || WARN "  $ifc não subiu"
+
+    # Watchdog: mantém a vítima SEMPRE reconectada, como um cliente real. Sem
+    # isso, após um flood de deauth o wpa_supplicant marca a rede como
+    # "temporarily disabled" (backoff) e não volta sozinho -> o aluno veria a
+    # vítima nunca mais reconectar depois do ataque. O loop reabilita e manda
+    # reconectar a cada 5s enquanto não estiver COMPLETED, gerando um novo
+    # 4-way handshake a cada reconexão (exercício repetível).
+    cat > "$LAB_DIR/${ifc}_watchdog.sh" <<EOF
+#!/bin/bash
+while true; do
+  if ! wpa_cli -p /run/wpa_${ifc} -i ${ifc} status 2>/dev/null | grep -q 'wpa_state=COMPLETED'; then
+    wpa_cli -p /run/wpa_${ifc} -i ${ifc} enable_network all >/dev/null 2>&1
+    wpa_cli -p /run/wpa_${ifc} -i ${ifc} reconnect >/dev/null 2>&1
+  fi
+  sleep 5
+done
+EOF
+    chmod +x "$LAB_DIR/${ifc}_watchdog.sh"
+    nohup bash "$LAB_DIR/${ifc}_watchdog.sh" >/dev/null 2>&1 &
+    echo $! > "$LAB_DIR/${ifc}_watchdog.pid"
+    OK "  watchdog de reconexão ativo ($ifc volta sozinho após o deauth)"
   done
 }
 
@@ -468,7 +489,8 @@ EOF
 # ===========================================================================
 lab_down() {
   LOG "Derrubando lab..."
-  for p in "$LAB_DIR/open_server.pid" "$LAB_DIR/open_bot.pid" "$LAB_DIR/macacl_traffic.pid"; do
+  for p in "$LAB_DIR/open_server.pid" "$LAB_DIR/open_bot.pid" "$LAB_DIR/macacl_traffic.pid" \
+           "$LAB_DIR/${STA_WPA2}_watchdog.pid"; do
     [[ -f "$p" ]] && kill "$(cat "$p")" 2>/dev/null
   done
   pkill -f "$LAB_DIR" 2>/dev/null

@@ -116,6 +116,8 @@ sudo airodump-ng -c 3 --bssid <BSSID_OPEN> -w /tmp/open mon_lab
 wireshark /tmp/open-01.cap       # filtro de display:  http.request.method == "POST"
 #   (sem GUI? use tshark)
 tshark -r /tmp/open-01.cap -Y 'http.request.method=="POST"' -T fields -e http.file_data
+# Captura direta
+sudo tshark -i mon_lab -f 'type data' -Y 'http.request.method=="POST"' -T fields -e http.file_data
 ```
 
 | Comando | O que faz |

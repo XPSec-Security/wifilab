@@ -1,0 +1,5 @@
+# Scripts de shell DEVEM usar fim de linha LF, mesmo editados no Windows.
+# Sem isto, um clone no Kali recebe CRLF e o script quebra com erros tipo
+# "$'\r': command not found" / "env: 'bash\r'".
+*.sh text eol=lf
+*.conf text eol=lf

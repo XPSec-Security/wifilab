@@ -135,6 +135,30 @@ assign_host_ifaces() {
   rename_if "${RAW[10]}" "$MON_IF"
 }
 
+# ---------------------------------------------------------------------------
+#  NetworkManager: libera os rádios do lab (unmanaged)
+# ---------------------------------------------------------------------------
+# Sem isto, o NetworkManager (e o wpa_supplicant do sistema que ele controla)
+# ficam gerenciando as interfaces hwsim: fazem scans em background, randomizam
+# o MAC e reassociam os rádios. O efeito é destrutivo para o lab -> o BSSID do
+# AP muda no meio do caminho (aireplay falha com "No such BSSID"), os rádios
+# pulam de canal (hostapd loga "handle_probe_req: send failed" e
+# INTERFACE-DISABLED), e deauth/captura/injeção param de funcionar de forma
+# intermitente. Marcar cada interface do lab como "unmanaged" resolve de forma
+# cirúrgica, sem tocar na eth0/SSH (só mexe nos rádios virtuais do lab).
+nm_release() {
+  command -v nmcli >/dev/null 2>&1 || return 0
+  systemctl is-active --quiet NetworkManager 2>/dev/null || return 0
+  LOG "Liberando interfaces do lab do NetworkManager (unmanaged)..."
+  local ifc
+  for ifc in "$AP_WPA2" "$AP_OPEN" "$AP_PMKID" "$AP_CORP" "$AP_MACACL" \
+             "$STA_WPA2" "$STA_OPEN" "$STA_CORP" "$STA_MACACL" "$ATK" "$MON_IF"; do
+    nmcli device set "$ifc" managed no >/dev/null 2>&1
+  done
+  sleep 1   # deixa o NM soltar os rádios antes do hostapd subir
+  OK "  Rádios do lab liberados do NetworkManager."
+}
+
 # ===========================================================================
 #  APs 2.4GHz no host: WPA2, OPEN
 # ===========================================================================
@@ -691,7 +715,7 @@ main() {
   case "${1:---up}" in
     --up)
       require_root "$@"; install_deps; check_deps
-      load_hwsim; assign_host_ifaces
+      load_hwsim; assign_host_ifaces; nm_release
       start_host_aps; start_5ghz_aps; start_open_bot
       start_host_clients; start_macacl_client; start_corp_victim
       print_summary ;;

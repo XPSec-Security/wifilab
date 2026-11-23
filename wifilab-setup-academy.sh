@@ -482,6 +482,27 @@ EOF
   wpa_supplicant -B -i "$STA_CORP" -c "$LAB_DIR/sta_corp.conf" -f "$LAB_DIR/sta_corp.log" 2>/dev/null \
     && OK "  Vítima $STA_CORP -> $SSID_CORP (conecta no AP legítimo; sem validar cert)" \
     || WARN "  Vítima EAP não associou (ver $LAB_DIR/sta_corp.log)"
+
+  # Watchdog: mesma lógica da vítima WPA2 (ver start_host_clients). Durante o
+  # ataque de evil twin o aluno derruba a vítima com deauth; sem isto o
+  # wpa_supplicant entra em backoff ("temporarily disabled") e não volta,
+  # então o evil twin nunca receberia a reautenticação (e o desafio/resposta
+  # MSCHAPv2 para quebrar). O loop reabilita e reconecta a cada 5s, fazendo a
+  # vítima reautenticar sozinha -> exercício repetível.
+  cat > "$LAB_DIR/sta_corp_watchdog.sh" <<EOF
+#!/bin/bash
+while true; do
+  if ! wpa_cli -p /run/wpa_corp -i $STA_CORP status 2>/dev/null | grep -q 'wpa_state=COMPLETED'; then
+    wpa_cli -p /run/wpa_corp -i $STA_CORP enable_network all >/dev/null 2>&1
+    wpa_cli -p /run/wpa_corp -i $STA_CORP reconnect >/dev/null 2>&1
+  fi
+  sleep 5
+done
+EOF
+  chmod +x "$LAB_DIR/sta_corp_watchdog.sh"
+  nohup bash "$LAB_DIR/sta_corp_watchdog.sh" >/dev/null 2>&1 &
+  echo $! > "$LAB_DIR/sta_corp_watchdog.pid"
+  OK "  watchdog de reconexão ativo ($STA_CORP reautentica sozinho após o deauth)"
 }
 
 # ===========================================================================
@@ -490,7 +511,7 @@ EOF
 lab_down() {
   LOG "Derrubando lab..."
   for p in "$LAB_DIR/open_server.pid" "$LAB_DIR/open_bot.pid" "$LAB_DIR/macacl_traffic.pid" \
-           "$LAB_DIR/${STA_WPA2}_watchdog.pid"; do
+           "$LAB_DIR/${STA_WPA2}_watchdog.pid" "$LAB_DIR/sta_corp_watchdog.pid"; do
     [[ -f "$p" ]] && kill "$(cat "$p")" 2>/dev/null
   done
   pkill -f "$LAB_DIR" 2>/dev/null

